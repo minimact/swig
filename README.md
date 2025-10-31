@@ -141,7 +141,7 @@ This distribution includes:
 
 ## 🎓 Learn Minimact
 
-- **Documentation:** [https://minimact.dev/docs](https://minimact.dev)
+- **Documentation:** [https://docs.minimact.com/](https://docs.minimact.com)
 - **Examples:** Check the `examples/` folder in Minimact projects
 - **Discord:** [https://discord.gg/minimact](https://discord.gg/minimact)
 - **GitHub:** [https://github.com/minimact](https://github.com/minimact)
@@ -274,8 +274,8 @@ Love Swig? Show your support:
 
 ## 🔗 Links
 
-- **Website:** [https://minimact.dev](https://minimact.dev)
-- **Docs:** [https://minimact.dev/docs](https://minimact.dev/docs)
+- **Website:** [https://minimact.com](https://minimact.com)
+- **Docs:** [https://docs.minimact.com](https://docs.minimact.com)
 - **GitHub:** [https://github.com/minimact](https://github.com/minimact)
 - **Discord:** [https://discord.gg/minimact](https://discord.gg/minimact)
 - **Twitter:** [@minimact](https://twitter.com/minimact)
