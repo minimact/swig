@@ -4177,6 +4177,17 @@ class EventDelegation {
                 const target = event.target;
                 argsObj.value = target.value;
             }
+            // Convert argsObj to array format expected by server
+            // Server expects: object[] args, so we pass the actual argument values as an array
+            const argsArray = [];
+            // For input/change events, pass the value as the first argument
+            if (argsObj.value !== undefined) {
+                argsArray.push(argsObj.value);
+            }
+            // For handlers with explicit args, add those
+            if (argsObj.args && Array.isArray(argsObj.args)) {
+                argsArray.push(...argsObj.args);
+            }
             // Check hint queue for cached prediction (CACHE HIT!)
             if (this.hintQueue && this.domPatcher) {
                 // Try to match hint based on the method being called
@@ -4203,7 +4214,7 @@ class EventDelegation {
                             confidence: (matchedHint.confidence * 100).toFixed(0) + '%'
                         });
                         // Still notify server in background for verification
-                        this.componentMethodInvoker(handler.componentId, handler.methodName, argsObj).catch(err => {
+                        this.componentMethodInvoker(handler.componentId, handler.methodName, argsArray).catch(err => {
                             console.error('[Minimact] Background server notification failed:', err);
                         });
                         return;
@@ -4211,7 +4222,7 @@ class EventDelegation {
                 }
             }
             // 🔴 CACHE MISS - No prediction found, send to server
-            await this.componentMethodInvoker(handler.componentId, handler.methodName, argsObj);
+            await this.componentMethodInvoker(handler.componentId, handler.methodName, argsArray);
             const latency = performance.now() - startTime;
             // Notify playground of cache miss
             if (this.playgroundBridge) {

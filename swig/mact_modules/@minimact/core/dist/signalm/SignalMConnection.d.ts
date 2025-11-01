@@ -62,6 +62,7 @@ export declare class SignalMConnection {
     private connect;
     /**
      * Internal: Handle incoming messages
+     * SignalR can send multiple messages in one WebSocket frame, separated by \x1E
      */
     private handleMessage;
     /**

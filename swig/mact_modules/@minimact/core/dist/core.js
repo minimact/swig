@@ -73,6 +73,31 @@ var Minimact = (function (exports) {
      */
     class JsonProtocol {
         /**
+         * Write handshake request message
+         * Must be sent immediately after WebSocket connection is established
+         */
+        static writeHandshake() {
+            const handshake = {
+                protocol: this.protocolName,
+                version: this.protocolVersion
+            };
+            return JSON.stringify(handshake) + this.RECORD_SEPARATOR;
+        }
+        /**
+         * Parse handshake response message
+         */
+        static parseHandshake(data) {
+            try {
+                const cleanData = data.endsWith(this.RECORD_SEPARATOR)
+                    ? data.slice(0, -1)
+                    : data;
+                return JSON.parse(cleanData);
+            }
+            catch (error) {
+                throw new Error(`Failed to parse handshake: ${error}`);
+            }
+        }
+        /**
          * Write invocation message (client → server RPC call)
          */
         static writeInvocation(invocationId, target, args) {
@@ -112,20 +137,26 @@ var Minimact = (function (exports) {
         }
         /**
          * Parse incoming message
+         * Removes record separator if present
          */
         static parseMessage(data) {
             try {
-                return JSON.parse(data);
+                // Remove record separator if present
+                const cleanData = data.endsWith(this.RECORD_SEPARATOR)
+                    ? data.slice(0, -1)
+                    : data;
+                return JSON.parse(cleanData);
             }
             catch (error) {
                 throw new Error(`Failed to parse message: ${error}`);
             }
         }
         /**
-         * Serialize message to JSON string
+         * Serialize message to JSON string with SignalR record separator
+         * SignalR requires all messages to end with \x1E
          */
         static serializeMessage(message) {
-            return JSON.stringify(message);
+            return JSON.stringify(message) + this.RECORD_SEPARATOR;
         }
         /**
          * Check if message is invocation
@@ -160,6 +191,11 @@ var Minimact = (function (exports) {
      * Protocol version
      */
     JsonProtocol.protocolVersion = 1;
+    /**
+     * SignalR message record separator (ASCII 30)
+     * Every SignalR message must be terminated with this character
+     */
+    JsonProtocol.RECORD_SEPARATOR = '\x1E';
 
     /**
      * Simple Event Emitter
@@ -419,16 +455,47 @@ var Minimact = (function (exports) {
                         reject(new Error(`Connection timeout after ${this.connectionTimeout}ms`));
                     }
                 }, this.connectionTimeout);
+                // Track handshake completion
+                let handshakeComplete = false;
                 this.ws.onopen = () => {
-                    clearTimeout(connectionTimeout);
-                    this.state = ConnectionState.Connected;
-                    this.reconnectAttempts = 0;
-                    this.log('Connected ✓');
-                    this.eventEmitter.emit('connected');
-                    resolve();
+                    // Send handshake immediately after connection
+                    const handshake = JsonProtocol.writeHandshake();
+                    this.log('Sending handshake', handshake);
+                    this.ws.send(handshake);
                 };
                 this.ws.onmessage = (event) => {
-                    this.handleMessage(event.data);
+                    // First message should be handshake response
+                    if (!handshakeComplete) {
+                        try {
+                            const response = JsonProtocol.parseHandshake(event.data);
+                            if (response.error) {
+                                clearTimeout(connectionTimeout);
+                                this.log('Handshake failed', response.error);
+                                this.ws?.close();
+                                reject(new Error(`Handshake failed: ${response.error}`));
+                                return;
+                            }
+                            // Handshake successful
+                            handshakeComplete = true;
+                            clearTimeout(connectionTimeout);
+                            this.state = ConnectionState.Connected;
+                            this.reconnectAttempts = 0;
+                            this.log('Handshake complete ✓');
+                            this.log('Connected ✓');
+                            this.eventEmitter.emit('connected');
+                            resolve();
+                        }
+                        catch (error) {
+                            clearTimeout(connectionTimeout);
+                            this.log('Handshake parse error', error);
+                            this.ws?.close();
+                            reject(new Error(`Handshake error: ${error}`));
+                        }
+                    }
+                    else {
+                        // Handle normal messages
+                        this.handleMessage(event.data);
+                    }
                 };
                 this.ws.onerror = (error) => {
                     this.log('WebSocket error', error);
@@ -442,32 +509,37 @@ var Minimact = (function (exports) {
         }
         /**
          * Internal: Handle incoming messages
+         * SignalR can send multiple messages in one WebSocket frame, separated by \x1E
          */
         handleMessage(data) {
-            try {
-                const message = JsonProtocol.parseMessage(data);
-                this.log(`Received message (type: ${message.type})`, message);
-                if (JsonProtocol.isInvocation(message)) {
-                    // Server calling client method
-                    this.handleInvocation(message);
+            // Split on record separator - server can send multiple messages at once
+            const messages = data.split('\x1E').filter(msg => msg.length > 0);
+            for (const messageData of messages) {
+                try {
+                    const message = JSON.parse(messageData);
+                    this.log(`Received message (type: ${message.type})`, message);
+                    if (JsonProtocol.isInvocation(message)) {
+                        // Server calling client method
+                        this.handleInvocation(message);
+                    }
+                    else if (JsonProtocol.isCompletion(message)) {
+                        // Response to client invoke()
+                        this.handleCompletion(message);
+                    }
+                    else if (JsonProtocol.isPing(message)) {
+                        // Server ping (respond with pong)
+                        this.handlePing();
+                    }
+                    else if (JsonProtocol.isClose(message)) {
+                        // Server requested close
+                        this.log('Server requested close', message.error);
+                        this.ws?.close(1000, 'Server closed connection');
+                    }
                 }
-                else if (JsonProtocol.isCompletion(message)) {
-                    // Response to client invoke()
-                    this.handleCompletion(message);
+                catch (error) {
+                    this.log('Error parsing message', error);
+                    console.error('[SignalM] Error parsing message:', error);
                 }
-                else if (JsonProtocol.isPing(message)) {
-                    // Server ping (respond with pong)
-                    this.handlePing();
-                }
-                else if (JsonProtocol.isClose(message)) {
-                    // Server requested close
-                    this.log('Server requested close', message.error);
-                    this.ws?.close(1000, 'Server closed connection');
-                }
-            }
-            catch (error) {
-                this.log('Error parsing message', error);
-                console.error('[SignalM] Error parsing message:', error);
             }
         }
         /**
@@ -1450,6 +1522,17 @@ var Minimact = (function (exports) {
                     const target = event.target;
                     argsObj.value = target.value;
                 }
+                // Convert argsObj to array format expected by server
+                // Server expects: object[] args, so we pass the actual argument values as an array
+                const argsArray = [];
+                // For input/change events, pass the value as the first argument
+                if (argsObj.value !== undefined) {
+                    argsArray.push(argsObj.value);
+                }
+                // For handlers with explicit args, add those
+                if (argsObj.args && Array.isArray(argsObj.args)) {
+                    argsArray.push(...argsObj.args);
+                }
                 // Check hint queue for cached prediction (CACHE HIT!)
                 if (this.hintQueue && this.domPatcher) {
                     // Try to match hint based on the method being called
@@ -1476,7 +1559,7 @@ var Minimact = (function (exports) {
                                 confidence: (matchedHint.confidence * 100).toFixed(0) + '%'
                             });
                             // Still notify server in background for verification
-                            this.componentMethodInvoker(handler.componentId, handler.methodName, argsObj).catch(err => {
+                            this.componentMethodInvoker(handler.componentId, handler.methodName, argsArray).catch(err => {
                                 console.error('[Minimact] Background server notification failed:', err);
                             });
                             return;
@@ -1484,7 +1567,7 @@ var Minimact = (function (exports) {
                     }
                 }
                 // 🔴 CACHE MISS - No prediction found, send to server
-                await this.componentMethodInvoker(handler.componentId, handler.methodName, argsObj);
+                await this.componentMethodInvoker(handler.componentId, handler.methodName, argsArray);
                 const latency = performance.now() - startTime;
                 // Notify playground of cache miss
                 if (this.playgroundBridge) {

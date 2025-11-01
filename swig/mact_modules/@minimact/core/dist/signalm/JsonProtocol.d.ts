@@ -17,6 +17,22 @@ export declare class JsonProtocol {
      */
     static readonly protocolVersion = 1;
     /**
+     * SignalR message record separator (ASCII 30)
+     * Every SignalR message must be terminated with this character
+     */
+    private static readonly RECORD_SEPARATOR;
+    /**
+     * Write handshake request message
+     * Must be sent immediately after WebSocket connection is established
+     */
+    static writeHandshake(): string;
+    /**
+     * Parse handshake response message
+     */
+    static parseHandshake(data: string): {
+        error?: string;
+    };
+    /**
      * Write invocation message (client → server RPC call)
      */
     static writeInvocation(invocationId: string, target: string, args: any[]): InvocationMessage;
@@ -34,10 +50,12 @@ export declare class JsonProtocol {
     static writeClose(error?: string): CloseMessage;
     /**
      * Parse incoming message
+     * Removes record separator if present
      */
     static parseMessage(data: string): Message;
     /**
-     * Serialize message to JSON string
+     * Serialize message to JSON string with SignalR record separator
+     * SignalR requires all messages to end with \x1E
      */
     static serializeMessage(message: Message): string;
     /**

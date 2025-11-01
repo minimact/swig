@@ -95,6 +95,9 @@ function generateJSXElement(node, component, indent) {
       const name = attr.name.name;
       const value = attr.value;
 
+      // Convert className to class for HTML compatibility
+      const htmlAttrName = name === 'className' ? 'class' : name;
+
       if (name.startsWith('on')) {
         // Event handler
         const handlerName = extractEventHandler(value, component);
@@ -102,19 +105,26 @@ function generateJSXElement(node, component, indent) {
       } else if (name.startsWith('data-minimact-')) {
         // Keep minimact attributes as-is
         const val = t.isStringLiteral(value) ? value.value : _generateCSharpExpression(value.expression);
-        dataMinimactAttrs.push(`["${name}"] = "${val}"`);
+        dataMinimactAttrs.push(`["${htmlAttrName}"] = "${val}"`);
       } else {
         // Regular prop
         if (t.isStringLiteral(value)) {
           // String literal - use as-is with quotes
-          props.push(`["${name}"] = "${escapeCSharpString(value.value)}"`);
+          props.push(`["${htmlAttrName}"] = "${escapeCSharpString(value.value)}"`);
         } else if (t.isJSXExpressionContainer(value)) {
-          // Expression - wrap in string interpolation
-          const expr = _generateCSharpExpression(value.expression);
-          props.push(`["${name}"] = $"{${expr}}"`);
+          // Special handling for style attribute with object expression
+          if (name === 'style' && t.isObjectExpression(value.expression)) {
+            const { convertStyleObjectToCss } = require('../utils/styleConverter.cjs');
+            const cssString = convertStyleObjectToCss(value.expression);
+            props.push(`["style"] = "${cssString}"`);
+          } else {
+            // Expression - wrap in string interpolation
+            const expr = _generateCSharpExpression(value.expression);
+            props.push(`["${htmlAttrName}"] = $"{${expr}}"`);
+          }
         } else {
           // Fallback
-          props.push(`["${name}"] = ""`);
+          props.push(`["${htmlAttrName}"] = ""`);
         }
       }
     }
@@ -141,8 +151,8 @@ function generateJSXElement(node, component, indent) {
         // Text already has quotes, wrap in VText
         return `new VText(${c.code})`;
       } else if (c.type === 'expression') {
-        // Expression needs string interpolation wrapper
-        return `new VText($"{${c.code}}")`;
+        // Expression needs string interpolation wrapper with extra parentheses for complex expressions
+        return `new VText($"{(${c.code})}")`;
       } else {
         // Element is already a VNode
         return c.code;

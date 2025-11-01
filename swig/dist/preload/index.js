@@ -4,7 +4,7 @@ const preload = require("@electron-toolkit/preload");
 const api = {
   // Project APIs
   project: {
-    create: (path, template) => electron.ipcRenderer.invoke("project:create", path, template),
+    create: (path, template, options) => electron.ipcRenderer.invoke("project:create", path, template, options),
     load: (path) => electron.ipcRenderer.invoke("project:load", path),
     getRecent: () => electron.ipcRenderer.invoke("project:getRecent"),
     scanFiles: (projectPath) => electron.ipcRenderer.invoke("project:scanFiles", projectPath),
@@ -13,7 +13,8 @@ const api = {
   // Transpiler APIs
   transpiler: {
     transpileFile: (filePath) => electron.ipcRenderer.invoke("transpiler:transpileFile", filePath),
-    transpileProject: (projectPath) => electron.ipcRenderer.invoke("transpiler:transpileProject", projectPath)
+    transpileProject: (projectPath) => electron.ipcRenderer.invoke("transpiler:transpileProject", projectPath),
+    generateTailwindCss: (projectPath) => electron.ipcRenderer.invoke("transpiler:generateTailwindCss", projectPath)
   },
   // Process control APIs
   process: {

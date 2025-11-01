@@ -63,10 +63,10 @@ function generateJSXExpression(expr, component, indent) {
     const condition = generateBooleanExpression(expr.test);
     const consequent = t.isJSXElement(expr.consequent) || t.isJSXFragment(expr.consequent)
       ? generateRuntimeHelperForJSXNode(expr.consequent, component, indent)
-      : generateCSharpExpression(expr.consequent);
+      : generateCSharpExpression(expr.consequent, false); // Normal C# expression context
     const alternate = t.isJSXElement(expr.alternate) || t.isJSXFragment(expr.alternate)
       ? generateRuntimeHelperForJSXNode(expr.alternate, component, indent)
-      : generateCSharpExpression(expr.alternate);
+      : generateCSharpExpression(expr.alternate, false); // Normal C# expression context
     return `(${condition}) ? ${consequent} : ${alternate}`;
   }
 
@@ -169,12 +169,19 @@ function generateCSharpStatement(node) {
 
 /**
  * Generate C# expression from JS expression
+ * @param {boolean} inInterpolation - True if this expression will be inside $"{...}"
  */
-function generateCSharpExpression(node) {
+function generateCSharpExpression(node, inInterpolation = false) {
   if (!node) return 'null';
 
   if (t.isStringLiteral(node)) {
-    return `"${escapeCSharpString(node.value)}"`;
+    // In string interpolation context, escape the quotes: \"text\"
+    // Otherwise use normal quotes: "text"
+    if (inInterpolation) {
+      return `\\"${escapeCSharpString(node.value)}\\"`;
+    } else {
+      return `"${escapeCSharpString(node.value)}"`;
+    }
   }
 
   if (t.isNumericLiteral(node)) {
@@ -193,6 +200,22 @@ function generateCSharpExpression(node) {
     return node.name;
   }
 
+  // Handle optional chaining: viewModel?.userEmail → viewModel?.UserEmail
+  if (t.isOptionalMemberExpression(node)) {
+    const object = generateCSharpExpression(node.object, inInterpolation);
+    const propertyName = t.isIdentifier(node.property) ? node.property.name : null;
+
+    // Capitalize first letter for C# property convention (userEmail → UserEmail)
+    const csharpProperty = propertyName
+      ? propertyName.charAt(0).toUpperCase() + propertyName.slice(1)
+      : propertyName;
+
+    const property = node.computed
+      ? `?[${generateCSharpExpression(node.property, inInterpolation)}]`
+      : `?.${csharpProperty}`;
+    return `${object}${property}`;
+  }
+
   if (t.isMemberExpression(node)) {
     const object = generateCSharpExpression(node.object);
     const propertyName = t.isIdentifier(node.property) ? node.property.name : null;
@@ -201,6 +224,19 @@ function generateCSharpExpression(node) {
     if (propertyName === 'length' && !node.computed) {
       // array.length → array.Count
       return `${object}.Count`;
+    }
+
+    // Handle event object property access (e.target.value → e.Target.Value)
+    if (propertyName === 'target' && !node.computed) {
+      return `${object}.Target`;
+    }
+    if (propertyName === 'value' && !node.computed) {
+      // Capitalize for C# property convention
+      return `${object}.Value`;
+    }
+    if (propertyName === 'checked' && !node.computed) {
+      // Capitalize for C# property convention
+      return `${object}.Checked`;
     }
 
     const property = node.computed
@@ -212,6 +248,13 @@ function generateCSharpExpression(node) {
   if (t.isArrayExpression(node)) {
     const elements = node.elements.map(e => generateCSharpExpression(e)).join(', ');
     return `new List<object> { ${elements} }`;
+  }
+
+  if (t.isUnaryExpression(node)) {
+    // Handle unary expressions: !expr, -expr, +expr, etc.
+    const argument = generateCSharpExpression(node.argument, inInterpolation);
+    const operator = node.operator;
+    return `${operator}${argument}`;
   }
 
   if (t.isBinaryExpression(node)) {
@@ -226,13 +269,36 @@ function generateCSharpExpression(node) {
 
   if (t.isConditionalExpression(node)) {
     // Handle ternary operator: test ? consequent : alternate
-    const test = generateCSharpExpression(node.test);
-    const consequent = generateCSharpExpression(node.consequent);
-    const alternate = generateCSharpExpression(node.alternate);
+    // Children are always in normal C# expression context, not interpolation context
+    const test = generateCSharpExpression(node.test, false);
+    const consequent = generateCSharpExpression(node.consequent, false);
+    const alternate = generateCSharpExpression(node.alternate, false);
     return `(${test}) ? ${consequent} : ${alternate}`;
   }
 
   if (t.isCallExpression(node)) {
+    // Handle Math.max() → Math.Max()
+    if (t.isMemberExpression(node.callee) &&
+        t.isIdentifier(node.callee.object, { name: 'Math' }) &&
+        t.isIdentifier(node.callee.property, { name: 'max' })) {
+      const args = node.arguments.map(arg => generateCSharpExpression(arg)).join(', ');
+      return `Math.Max(${args})`;
+    }
+
+    // Handle Math.min() → Math.Min()
+    if (t.isMemberExpression(node.callee) &&
+        t.isIdentifier(node.callee.object, { name: 'Math' }) &&
+        t.isIdentifier(node.callee.property, { name: 'min' })) {
+      const args = node.arguments.map(arg => generateCSharpExpression(arg)).join(', ');
+      return `Math.Min(${args})`;
+    }
+
+    // Handle alert() → Console.WriteLine() (or custom alert implementation)
+    if (t.isIdentifier(node.callee, { name: 'alert' })) {
+      const args = node.arguments.map(arg => generateCSharpExpression(arg)).join(' + ');
+      return `Console.WriteLine(${args})`;
+    }
+
     // Handle console.log → Console.WriteLine
     if (t.isMemberExpression(node.callee) &&
         t.isIdentifier(node.callee.object, { name: 'console' }) &&

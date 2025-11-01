@@ -4,7 +4,8 @@
 
 const t = require('@babel/types');
 const { generateCSharpExpression } = require('../generators/expressions.cjs');
-const { inferType } = require('../types/typeConversion.cjs');
+const { inferType, tsTypeToCSharpType } = require('../types/typeConversion.cjs');
+const { extractUseStateX } = require('./useStateX.cjs');
 
 /**
  * Extract hook calls (useState, useClientState, etc.)
@@ -22,6 +23,9 @@ function extractHook(path, component) {
       break;
     case 'useClientState':
       extractUseState(path, component, 'useClientState');
+      break;
+    case 'useStateX':
+      extractUseStateX(path, component);
       break;
     case 'useEffect':
       extractUseEffect(path, component);
@@ -71,6 +75,12 @@ function extractHook(path, component) {
     case 'usePaginatedServerTask':
       extractUsePaginatedServerTask(path, component);
       break;
+    case 'useMvcState':
+      extractUseMvcState(path, component);
+      break;
+    case 'useMvcViewModel':
+      extractUseMvcViewModel(path, component);
+      break;
   }
 }
 
@@ -86,11 +96,19 @@ function extractUseState(path, component, hookType) {
   const [stateVar, setterVar] = parent.id.elements;
   const initialValue = path.node.arguments[0];
 
+  // Check if there's a generic type parameter (e.g., useState<decimal>(0))
+  let explicitType = null;
+  if (path.node.typeParameters && path.node.typeParameters.params.length > 0) {
+    const typeParam = path.node.typeParameters.params[0];
+    explicitType = tsTypeToCSharpType(typeParam);
+    console.log(`[useState] Found explicit type parameter for '${stateVar.name}': ${explicitType}`);
+  }
+
   const stateInfo = {
     name: stateVar.name,
     setter: setterVar.name,
     initialValue: generateCSharpExpression(initialValue),
-    type: inferType(initialValue)
+    type: explicitType || inferType(initialValue) // Prefer explicit type over inferred
   };
 
   if (hookType === 'useState') {
@@ -638,6 +656,194 @@ function extractReturnType(asyncFunction) {
   return 'object';
 }
 
+/**
+ * Extract useMvcState hook
+ *
+ * Pattern: const [value, setValue] = useMvcState<T>('propertyName', options?)
+ *
+ * This hook accesses MVC ViewModel properties passed from the controller.
+ * The babel plugin treats these as special client-side state that maps
+ * to server ViewModel properties.
+ */
+function extractUseMvcState(path, component) {
+  const parent = path.parent;
+
+  if (!t.isVariableDeclarator(parent)) return;
+  if (!t.isArrayPattern(parent.id)) return;
+
+  const elements = parent.id.elements;
+  const propertyNameArg = path.node.arguments[0];
+
+  // Extract property name (must be string literal)
+  if (!t.isStringLiteral(propertyNameArg)) {
+    console.warn('[useMvcState] Property name must be a string literal');
+    return;
+  }
+
+  const propertyName = propertyNameArg.value;
+
+  // useMvcState can return either [value] or [value, setter]
+  // depending on mutability
+  const stateVar = elements[0];
+  const setterVar = elements.length > 1 ? elements[1] : null;
+
+  // Extract TypeScript generic type: useMvcState<string>('name')
+  // But prefer the type from the ViewModel interface if available (more reliable)
+  const typeParam = path.node.typeParameters?.params[0];
+  let csharpType = typeParam ? tsTypeToCSharpType(typeParam) : 'dynamic';
+
+  // Try to find the actual type from the ViewModel interface
+  const interfaceType = findViewModelPropertyType(path, propertyName, component);
+  if (interfaceType) {
+    csharpType = interfaceType;
+    console.log(`[useMvcState] Found type for '${propertyName}' from interface: ${interfaceType}`);
+  } else {
+    console.log(`[useMvcState] Using generic type for '${propertyName}': ${csharpType}`);
+  }
+
+  // Initialize useMvcState array if needed
+  component.useMvcState = component.useMvcState || [];
+
+  const mvcStateInfo = {
+    name: stateVar ? stateVar.name : null,
+    setter: setterVar ? setterVar.name : null,
+    propertyName: propertyName,
+    type: csharpType  // ✅ Use type from interface (preferred) or generic fallback
+  };
+
+  component.useMvcState.push(mvcStateInfo);
+
+  // Track as MVC state type
+  if (stateVar) {
+    component.stateTypes = component.stateTypes || new Map();
+    component.stateTypes.set(stateVar.name, 'mvc');
+  }
+}
+
+/**
+ * Extract useMvcViewModel hook
+ *
+ * Pattern: const viewModel = useMvcViewModel<TViewModel>()
+ *
+ * This hook provides read-only access to the entire MVC ViewModel.
+ * The babel plugin doesn't need to generate C# for this as it's
+ * purely client-side access to the embedded ViewModel JSON.
+ */
+function extractUseMvcViewModel(path, component) {
+  const parent = path.parent;
+
+  if (!t.isVariableDeclarator(parent)) return;
+  if (!t.isIdentifier(parent.id)) return;
+
+  const viewModelVarName = parent.id.name;
+
+  // Initialize useMvcViewModel array if needed
+  component.useMvcViewModel = component.useMvcViewModel || [];
+
+  component.useMvcViewModel.push({
+    name: viewModelVarName
+  });
+
+  // Note: This is primarily for documentation/tracking purposes.
+  // The actual ViewModel access happens client-side via window.__MINIMACT_VIEWMODEL__
+}
+
+/**
+ * Find the type of a property from the ViewModel interface
+ *
+ * Searches the AST for an interface named *ViewModel and extracts the property type
+ */
+function findViewModelPropertyType(path, propertyName, component) {
+  // Find the program (top-level) node
+  let programPath = path;
+  while (programPath && !t.isProgram(programPath.node)) {
+    programPath = programPath.parentPath;
+  }
+
+  if (!programPath) {
+    console.log(`[findViewModelPropertyType] No program path found for ${propertyName}`);
+    return null;
+  }
+
+  // ⚠️ CRITICAL: Check metadata first (interfaces stored before transformation)
+  // The TranspilerService stores interfaces in metadata before @babel/preset-typescript strips them
+  let viewModelInterface = null;
+  const programNode = programPath.node;
+
+  if (programNode.metadata && programNode.metadata.viewModelInterfaces) {
+    const interfaces = programNode.metadata.viewModelInterfaces;
+    console.log(`[findViewModelPropertyType] Found ${interfaces.length} interfaces in metadata`);
+
+    for (const iface of interfaces) {
+      if (iface.id && iface.id.name && iface.id.name.endsWith('ViewModel')) {
+        viewModelInterface = iface;
+        console.log(`[findViewModelPropertyType] ✅ Using interface from metadata: ${iface.id.name}`);
+        break;
+      }
+    }
+  } else {
+    // Fallback: Search program body (won't work if TypeScript preset already ran)
+    console.log(`[findViewModelPropertyType] No metadata found, searching program body`);
+
+    if (!programNode || !programNode.body) {
+      console.log(`[findViewModelPropertyType] No program body found`);
+      return null;
+    }
+
+    console.log(`[findViewModelPropertyType] Program body has ${programNode.body.length} statements`);
+
+    // Debug: Log all statement types
+    programNode.body.forEach((stmt, idx) => {
+      console.log(`[findViewModelPropertyType] Statement ${idx}: ${stmt.type}`);
+    });
+
+    // Iterate through top-level statements to find interface declarations
+    let interfaceCount = 0;
+    for (const statement of programNode.body) {
+      if (t.isTSInterfaceDeclaration(statement)) {
+        interfaceCount++;
+        const interfaceName = statement.id.name;
+        console.log(`[findViewModelPropertyType] Found interface #${interfaceCount}: ${interfaceName}`);
+
+        // Look for interfaces ending with "ViewModel"
+        if (interfaceName.endsWith('ViewModel')) {
+          viewModelInterface = statement;
+          console.log(`[findViewModelPropertyType] ✅ Using interface: ${interfaceName}`);
+          break; // Use the first matching interface
+        }
+      }
+    }
+
+    console.log(`[findViewModelPropertyType] Total interfaces found: ${interfaceCount}`);
+  }
+
+  if (!viewModelInterface) {
+    console.log(`[findViewModelPropertyType] ❌ No ViewModel interface found`);
+    return null;
+  }
+
+  // Find the property in the interface
+  for (const member of viewModelInterface.body.body) {
+    if (t.isTSPropertySignature(member)) {
+      const key = member.key;
+
+      if (t.isIdentifier(key) && key.name === propertyName) {
+        // Found the property! Extract its type
+        const typeAnnotation = member.typeAnnotation?.typeAnnotation;
+        console.log(`[findViewModelPropertyType] Found property ${propertyName}, typeAnnotation:`, typeAnnotation);
+        if (typeAnnotation) {
+          const csharpType = tsTypeToCSharpType(typeAnnotation);
+          console.log(`[findViewModelPropertyType] Mapped ${propertyName} type to: ${csharpType}`);
+          return csharpType;
+        }
+      }
+    }
+  }
+
+  console.log(`[findViewModelPropertyType] Property ${propertyName} not found in interface`);
+  return null;
+}
+
 module.exports = {
   extractHook,
   extractUseState,
@@ -655,5 +861,7 @@ module.exports = {
   extractUseMacroTask,
   extractUseSignalR,
   extractUsePredictHint,
-  extractUseServerTask
+  extractUseServerTask,
+  extractUseMvcState,
+  extractUseMvcViewModel
 };

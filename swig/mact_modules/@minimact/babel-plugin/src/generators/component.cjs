@@ -26,6 +26,54 @@ function generateComponent(component) {
     }
   }
 
+  // StateX projection attributes (for declarative state projections)
+  if (component.useStateX && component.useStateX.length > 0) {
+    for (let i = 0; i < component.useStateX.length; i++) {
+      const stateX = component.useStateX[i];
+      const stateKey = `stateX_${i}`;
+
+      for (const target of stateX.targets) {
+        const parts = [];
+
+        // Required: stateKey and selector
+        parts.push(`"${stateKey}"`);
+        parts.push(`"${target.selector}"`);
+
+        // Optional: Transform (C# lambda)
+        if (target.transform) {
+          parts.push(`Transform = @"${target.transform}"`);
+        }
+
+        // Optional: TransformId (registry reference)
+        if (target.transformId) {
+          parts.push(`TransformId = "${target.transformId}"`);
+        }
+
+        // Optional: ApplyAs mode
+        if (target.applyAs && target.applyAs !== 'textContent') {
+          parts.push(`ApplyAs = "${target.applyAs}"`);
+        }
+
+        // Optional: Property name
+        if (target.property) {
+          parts.push(`Property = "${target.property}"`);
+        }
+
+        // Optional: ApplyIf condition
+        if (target.applyIf && target.applyIf.csharpCode) {
+          parts.push(`ApplyIf = @"${target.applyIf.csharpCode}"`);
+        }
+
+        // Optional: Template hint
+        if (target.template) {
+          parts.push(`Template = "${target.template}"`);
+        }
+
+        lines.push(`[StateXTransform(${parts.join(', ')})]`);
+      }
+    }
+  }
+
   // Class declaration
   lines.push('[Component]');
 
@@ -57,6 +105,35 @@ function generateComponent(component) {
   for (const state of component.useState) {
     lines.push(`    [State]`);
     lines.push(`    private ${state.type} ${state.name} = ${state.initialValue};`);
+    lines.push('');
+  }
+
+  // MVC State fields (useMvcState)
+  // ❌ DO NOT GENERATE [State] FIELDS FOR useMvcState!
+  // MVC ViewModel already populates these values in the State dictionary.
+  // Instead, generate readonly properties that access State dictionary with typed GetState<T>.
+  if (component.useMvcState) {
+    for (const mvcState of component.useMvcState) {
+      const csharpType = mvcState.type || 'dynamic';
+      lines.push(`    // MVC State property: ${mvcState.propertyName}`);
+      lines.push(`    private ${csharpType} ${mvcState.name} => GetState<${csharpType}>("${mvcState.propertyName}");`);
+      lines.push('');
+    }
+  }
+
+  // MVC ViewModel fields (useMvcViewModel)
+  if (component.useMvcViewModel) {
+    for (const viewModel of component.useMvcViewModel) {
+      lines.push(`    // useMvcViewModel - read-only access to entire ViewModel`);
+      lines.push(`    private dynamic ${viewModel.name} = null;`);
+      lines.push('');
+    }
+  }
+
+  // State fields (useStateX)
+  for (const stateX of component.useStateX) {
+    lines.push(`    [State]`);
+    lines.push(`    private ${stateX.initialValueType} ${stateX.varName} = ${stateX.initialValue};`);
     lines.push('');
   }
 
@@ -215,6 +292,17 @@ function generateComponent(component) {
     lines.push('');
   }
 
+  // MVC State local variables - read from State dictionary
+  if (component.useMvcState && component.useMvcState.length > 0) {
+    lines.push('        // MVC State - read from State dictionary');
+    for (const mvcState of component.useMvcState) {
+      const csharpType = mvcState.type !== 'object' ? mvcState.type : 'dynamic';
+      // Use propertyName (e.g., 'initialQuantity') not variable name (e.g., 'quantity')
+      lines.push(`        var ${mvcState.name} = GetState<${csharpType}>("${mvcState.propertyName}");`);
+    }
+    lines.push('');
+  }
+
   // Local variables (exclude client-computed ones, they're properties now)
   const regularLocalVars = component.localVariables.filter(v => !v.isClientComputed);
   for (const localVar of regularLocalVars) {
@@ -284,7 +372,8 @@ function generateComponent(component) {
       ? params.map(p => t.isIdentifier(p) ? `dynamic ${p.name}` : 'dynamic arg').join(', ')
       : '';
 
-    lines.push(`    private void ${handler.name}(${paramStr})`);
+    // Event handlers must be public so SignalR hub can call them
+    lines.push(`    public void ${handler.name}(${paramStr})`);
     lines.push('    {');
 
     // Generate method body
@@ -316,6 +405,11 @@ function generateComponent(component) {
     lines.push(`        SetState("${toggle.name}", ${toggle.name});`);
     lines.push('    }');
   }
+
+  // MVC State setter methods (useMvcState)
+  // MVC State setter methods - REMOVED
+  // These are now generated at the end of the class (after event handlers)
+  // with the correct property names from the ViewModel (not variable names)
 
   // Pub/Sub methods (usePub)
   if (component.usePub) {
@@ -362,6 +456,20 @@ function generateComponent(component) {
       lines.push(`            await HubContext.Clients.Client(ConnectionId).SendAsync(methodName, args);`);
       lines.push(`        }`);
       lines.push('    }');
+    }
+  }
+
+  // MVC State setter methods
+  if (component.useMvcState) {
+    for (const mvcState of component.useMvcState) {
+      if (mvcState.setter) {
+        const csharpType = mvcState.type !== 'object' ? mvcState.type : 'dynamic';
+        lines.push('');
+        lines.push(`    private void ${mvcState.setter}(${csharpType} value)`);
+        lines.push('    {');
+        lines.push(`        SetState("${mvcState.propertyName}", value);`);
+        lines.push('    }');
+      }
     }
   }
 
