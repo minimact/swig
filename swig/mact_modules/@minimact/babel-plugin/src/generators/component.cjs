@@ -152,6 +152,17 @@ function generateComponent(component) {
     lines.push('');
   }
 
+  // Razor Markdown fields (useRazorMarkdown)
+  // These are initialized in OnInitialized() after Razor syntax is evaluated
+  if (component.useRazorMarkdown) {
+    for (const md of component.useRazorMarkdown) {
+      lines.push(`    [RazorMarkdown]`);
+      lines.push(`    [State]`);
+      lines.push(`    private string ${md.name} = null!;`);
+      lines.push('');
+    }
+  }
+
   // Validation fields (useValidation)
   for (const validation of component.useValidation) {
     lines.push(`    [Validation]`);
@@ -368,16 +379,35 @@ function generateComponent(component) {
 
     // Generate parameter list
     const params = handler.params || [];
-    const paramStr = params.length > 0
-      ? params.map(p => t.isIdentifier(p) ? `dynamic ${p.name}` : 'dynamic arg').join(', ')
-      : '';
+    let paramList = params.length > 0
+      ? params.map(p => t.isIdentifier(p) ? `dynamic ${p.name}` : 'dynamic arg')
+      : [];
+
+    // Add captured parameters from .map() context (e.g., item, index)
+    const capturedParams = handler.capturedParams || [];
+    if (capturedParams.length > 0) {
+      paramList = paramList.concat(capturedParams.map(p => `dynamic ${p}`));
+    }
+
+    const paramStr = paramList.join(', ');
 
     // Event handlers must be public so SignalR hub can call them
-    lines.push(`    public void ${handler.name}(${paramStr})`);
+    // Use async Task if handler contains await
+    const returnType = handler.isAsync ? 'async Task' : 'void';
+    lines.push(`    public ${returnType} ${handler.name}(${paramStr})`);
     lines.push('    {');
 
+    // Check if this is a curried function error
+    if (handler.isCurriedError) {
+      lines.push(`        throw new InvalidOperationException(`);
+      lines.push(`            "Event handler '${handler.name}' returns a function instead of executing an action. " +`);
+      lines.push(`            "This is a curried function pattern (e.g., (e) => (id) => action(id)) which is invalid for event handlers. " +`);
+      lines.push(`            "The returned function is never called by the event system. " +`);
+      lines.push(`            "Fix: Use (e) => action(someValue) or create a properly bound handler."`);
+      lines.push(`        );`);
+    }
     // Generate method body
-    if (handler.body) {
+    else if (handler.body) {
       if (t.isBlockStatement(handler.body)) {
         // Block statement: { ... }
         for (const statement of handler.body.body) {
@@ -470,6 +500,95 @@ function generateComponent(component) {
         lines.push(`        SetState("${mvcState.propertyName}", value);`);
         lines.push('    }');
       }
+    }
+  }
+
+  // OnInitialized method for Razor Markdown initialization
+  if (component.useRazorMarkdown && component.useRazorMarkdown.length > 0) {
+    const { convertRazorMarkdownToCSharp } = require('./razorMarkdown.cjs');
+
+    lines.push('');
+    lines.push('    protected override void OnInitialized()');
+    lines.push('    {');
+    lines.push('        base.OnInitialized();');
+    lines.push('');
+
+    for (const md of component.useRazorMarkdown) {
+      // Convert Razor markdown to C# string interpolation
+      const csharpMarkdown = convertRazorMarkdownToCSharp(md.initialValue);
+      lines.push(`        ${md.name} = ${csharpMarkdown};`);
+    }
+
+    lines.push('    }');
+  }
+
+  // Helper functions (function declarations in component body)
+  if (component.helperFunctions && component.helperFunctions.length > 0) {
+    for (const func of component.helperFunctions) {
+      lines.push('');
+
+      const returnType = func.isAsync
+        ? (func.returnType === 'void' ? 'async Task' : `async Task<${func.returnType}>`)
+        : func.returnType;
+
+      const params = (func.params || []).map(p => `${p.type} ${p.name}`).join(', ');
+
+      lines.push(`    private ${returnType} ${func.name}(${params})`);
+      lines.push('    {');
+
+      // Generate function body
+      if (func.body && t.isBlockStatement(func.body)) {
+        for (const statement of func.body.body) {
+          const stmtCode = generateCSharpStatement(statement, 2);
+          lines.push(stmtCode);
+        }
+      }
+
+      lines.push('    }');
+    }
+  }
+
+  // Helper functions (standalone functions referenced by component)
+  if (component.topLevelHelperFunctions && component.topLevelHelperFunctions.length > 0) {
+    for (const helper of component.topLevelHelperFunctions) {
+      lines.push('');
+      lines.push(`    // Helper function: ${helper.name}`);
+
+      // Generate the function signature
+      const func = helper.node;
+      const params = (func.params || []).map(p => {
+        // Get parameter type from TypeScript annotation
+        let paramType = 'dynamic';
+        if (p.typeAnnotation && p.typeAnnotation.typeAnnotation) {
+          paramType = tsTypeToCSharpType(p.typeAnnotation.typeAnnotation);
+        }
+        return `${paramType} ${p.name}`;
+      }).join(', ');
+
+      // Get return type from TypeScript annotation
+      let returnType = 'dynamic';
+      if (func.returnType && func.returnType.typeAnnotation) {
+        returnType = tsTypeToCSharpType(func.returnType.typeAnnotation);
+      }
+
+      lines.push(`    private static ${returnType} ${helper.name}(${params})`);
+      lines.push('    {');
+
+      // Generate function body
+      if (t.isBlockStatement(func.body)) {
+        for (const statement of func.body.body) {
+          const csharpStmt = generateCSharpStatement(statement);
+          if (csharpStmt) {
+            lines.push(`        ${csharpStmt}`);
+          }
+        }
+      } else {
+        // Expression body (arrow function)
+        const csharpExpr = generateCSharpExpression(func.body);
+        lines.push(`        return ${csharpExpr};`);
+      }
+
+      lines.push('    }');
     }
   }
 

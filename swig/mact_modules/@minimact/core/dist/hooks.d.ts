@@ -130,3 +130,33 @@ export declare function useServerTask<T>(taskFactory?: () => Promise<T>, options
  * ```
  */
 export declare function useServerReducer<TState, TAction>(initialState: TState): ServerReducer<TState, TAction>;
+/**
+ * useMarkdown hook - for markdown content that gets parsed to HTML on server
+ *
+ * Pattern: const [content, setContent] = useMarkdown('# Hello World');
+ *
+ * Server-side behavior:
+ * - Babel transpiles this to [Markdown][State] string field
+ * - Server renders markdown → HTML via MarkdownHelper.ToHtml()
+ * - JSX references get wrapped in DivRawHtml(MarkdownHelper.ToHtml(content))
+ *
+ * Client-side behavior:
+ * - Behaves exactly like useState<string>
+ * - Receives pre-rendered HTML in patches from server
+ * - State changes sync to server (which re-renders markdown to HTML)
+ *
+ * Example:
+ * ```tsx
+ * const [content, setContent] = useMarkdown('# Title\n\n**Bold text**');
+ *
+ * return (
+ *   <div>
+ *     {content}  // Server renders as: <h1>Title</h1><p><strong>Bold text</strong></p>
+ *   </div>
+ * );
+ * ```
+ *
+ * @param initialValue - Initial markdown string
+ * @returns Tuple of [content, setContent] where content is markdown string
+ */
+export declare function useMarkdown(initialValue: string): [string, (newValue: string | ((prev: string) => string)) => void];

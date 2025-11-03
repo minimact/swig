@@ -71,7 +71,7 @@ const t$g = globalThis.__BABEL_TYPES__;
 /**
  * Convert TypeScript type annotation to C# type
  */
-function tsTypeToCSharpType$3(tsType) {
+function tsTypeToCSharpType$4(tsType) {
   if (!tsType) return 'dynamic';
 
   // TSStringKeyword -> string
@@ -88,7 +88,7 @@ function tsTypeToCSharpType$3(tsType) {
 
   // TSArrayType -> List<T>
   if (t$g.isTSArrayType(tsType)) {
-    const elementType = tsTypeToCSharpType$3(tsType.elementType);
+    const elementType = tsTypeToCSharpType$4(tsType.elementType);
     return `List<${elementType}>`;
   }
 
@@ -141,7 +141,12 @@ function inferType$2(node) {
   if (!node) return 'dynamic';
 
   if (t$g.isStringLiteral(node)) return 'string';
-  if (t$g.isNumericLiteral(node)) return 'int';
+  if (t$g.isNumericLiteral(node)) {
+    // Check if the number has a decimal point
+    // If the value is a whole number, use int; otherwise use double
+    const value = node.value;
+    return Number.isInteger(value) ? 'int' : 'double';
+  }
   if (t$g.isBooleanLiteral(node)) return 'bool';
   if (t$g.isNullLiteral(node)) return 'dynamic';
   if (t$g.isArrayExpression(node)) return 'List<dynamic>';
@@ -153,7 +158,7 @@ function inferType$2(node) {
 
 var typeConversion = {
   inferType: inferType$2,
-  tsTypeToCSharpType: tsTypeToCSharpType$3
+  tsTypeToCSharpType: tsTypeToCSharpType$4
 };
 
 /**
@@ -360,6 +365,26 @@ function extractEventHandler(value, component) {
       // Inline arrow function - extract to named method
       const handlerName = `Handle${component.eventHandlers.length}`;
 
+      // Check if the function is async
+      const isAsync = expr.async || false;
+
+      // Detect curried functions (functions that return functions)
+      // Pattern: (e) => (id) => action(id)
+      // This is invalid for event handlers because the returned function is never called
+      if (t$d.isArrowFunctionExpression(expr.body) || t$d.isFunctionExpression(expr.body)) {
+        // Generate a handler that throws a helpful error
+        component.eventHandlers.push({
+          name: handlerName,
+          body: null, // Will be handled specially in component generator
+          params: expr.params,
+          capturedParams: [],
+          isAsync: false,
+          isCurriedError: true // Flag to generate error throw
+        });
+
+        return handlerName;
+      }
+
       // Simplify common pattern: (e) => func(e.target.value)
       // Transform to: (value) => func(value)
       let body = expr.body;
@@ -389,11 +414,81 @@ function extractEventHandler(value, component) {
         }
       }
 
+      // Check if we're inside a .map() context and capture those variables
+      const capturedParams = component.currentMapContext ? component.currentMapContext.params : [];
+
+      // Handle parameter destructuring
+      // Convert ({ target: { value } }) => ... into (e) => ... with unpacking in body
+      const hasDestructuring = params.some(p => t$d.isObjectPattern(p));
+      let processedBody = body;
+      let processedParams = params;
+
+      if (hasDestructuring && params.length === 1 && t$d.isObjectPattern(params[0])) {
+        // Extract destructured properties
+        const destructuringStatements = [];
+        const eventParam = t$d.identifier('e');
+
+        function extractDestructured(pattern, path = []) {
+          if (t$d.isObjectPattern(pattern)) {
+            for (const prop of pattern.properties) {
+              if (t$d.isObjectProperty(prop)) {
+                const key = t$d.isIdentifier(prop.key) ? prop.key.name : null;
+                if (key && t$d.isIdentifier(prop.value)) {
+                  // Simple: { value } or { target: { value } }
+                  const varName = prop.value.name;
+                  const accessPath = [...path, key];
+                  destructuringStatements.push({ varName, accessPath });
+                } else if (key && t$d.isObjectPattern(prop.value)) {
+                  // Nested: { target: { value } }
+                  extractDestructured(prop.value, [...path, key]);
+                }
+              }
+            }
+          }
+        }
+
+        extractDestructured(params[0]);
+        processedParams = [eventParam];
+
+        // Prepend destructuring assignments to body
+        if (destructuringStatements.length > 0) {
+          const assignments = destructuringStatements.map(({ varName, accessPath }) => {
+            // Build e.Target.Value access chain
+            let access = eventParam;
+            for (const key of accessPath) {
+              const capitalizedKey = key.charAt(0).toUpperCase() + key.slice(1);
+              access = t$d.memberExpression(access, t$d.identifier(capitalizedKey));
+            }
+            return t$d.variableDeclaration('var', [
+              t$d.variableDeclarator(t$d.identifier(varName), access)
+            ]);
+          });
+
+          // Wrap body in block statement with destructuring
+          if (t$d.isBlockStatement(body)) {
+            processedBody = t$d.blockStatement([...assignments, ...body.body]);
+          } else {
+            processedBody = t$d.blockStatement([...assignments, t$d.expressionStatement(body)]);
+          }
+        }
+      }
+
       component.eventHandlers.push({
         name: handlerName,
-        body: body,
-        params: params
+        body: processedBody,
+        params: processedParams,
+        capturedParams: capturedParams,  // e.g., ['item', 'index']
+        isAsync: isAsync  // Track if handler is async
       });
+
+      // Return handler registration string
+      // If there are captured params, append them as colon-separated interpolations
+      // Format: "Handle0:{item}:{index}" - matches client's existing "Method:arg1:arg2" parser
+      if (capturedParams.length > 0) {
+        const capturedRefs = capturedParams.map(p => `{${p}}`).join(':');
+        return `${handlerName}:${capturedRefs}`;
+      }
+
       return handlerName;
     }
 
@@ -404,7 +499,24 @@ function extractEventHandler(value, component) {
     if (t$d.isCallExpression(expr)) {
       // () => someMethod() - extract
       const handlerName = `Handle${component.eventHandlers.length}`;
-      component.eventHandlers.push({ name: handlerName, body: expr });
+
+      // Check if we're inside a .map() context and capture those variables
+      const capturedParams = component.currentMapContext ? component.currentMapContext.params : [];
+
+      component.eventHandlers.push({
+        name: handlerName,
+        body: expr,
+        capturedParams: capturedParams  // e.g., ['item', 'index']
+      });
+
+      // Return handler registration string
+      // If there are captured params, append them as colon-separated interpolations
+      // Format: "Handle0:{item}:{index}" - matches client's existing "Method:arg1:arg2" parser
+      if (capturedParams.length > 0) {
+        const capturedRefs = capturedParams.map(p => `{${p}}`).join(':');
+        return `${handlerName}:${capturedRefs}`;
+      }
+
       return handlerName;
     }
   }
@@ -431,7 +543,7 @@ var hasRequiredPlugin;
 function requirePlugin () {
 	if (hasRequiredPlugin) return plugin;
 	hasRequiredPlugin = 1;
-	const { generateExpression } = requireExpressions();
+	const { generateCSharpExpression } = requireExpressions();
 
 	/**
 	 * Generate C# code for a plugin usage
@@ -477,7 +589,7 @@ function requirePlugin () {
 
 	    case 'complexExpression':
 	      // Complex expression: evaluate using expression generator
-	      return generateExpression(stateBinding.expression);
+	      return generateCSharpExpression(stateBinding.expression);
 
 	    default:
 	      throw new Error(`Unknown state binding type: ${stateBinding.type}`);
@@ -499,7 +611,7 @@ function requirePlugin () {
 
 	  const propStrings = properties.map(prop => {
 	    const key = prop.key.name || prop.key.value;
-	    const value = generateExpression(prop.value);
+	    const value = generateCSharpExpression(prop.value);
 	    return `${key} = ${value}`;
 	  });
 
@@ -669,6 +781,12 @@ function requireJsx () {
 	    return generateFragment(node, component, indent);
 	  }
 
+	  // Validate that this is actually a JSXElement
+	  if (!t.isJSXElement(node)) {
+	    console.error('[jsx.cjs] generateJSXElement called with non-JSX node:', node?.type || 'undefined');
+	    throw new Error(`generateJSXElement expects JSXElement or JSXFragment, received: ${node?.type || 'undefined'}`);
+	  }
+
 	  const tagName = node.openingElement.name.name;
 	  const attributes = node.openingElement.attributes;
 	  const children = node.children;
@@ -676,12 +794,15 @@ function requireJsx () {
 	  // Check if this is a Plugin element
 	  if (tagName === 'Plugin') {
 	    const { generatePluginNode } = requirePlugin();
+
 	    // Find the matching plugin metadata from component.pluginUsages
-	    const pluginMetadata = component.pluginUsages.find(p => {
-	      // Match by finding the plugin in the same location in the tree
-	      // For now, just use the first match (simple case)
-	      return true; // TODO: Improve matching logic if multiple plugins
-	    });
+	    // Use the plugin index tracker to match plugins in order
+	    if (!component._pluginRenderIndex) {
+	      component._pluginRenderIndex = 0;
+	    }
+
+	    const pluginMetadata = component.pluginUsages[component._pluginRenderIndex];
+	    component._pluginRenderIndex++;
 
 	    if (pluginMetadata) {
 	      return generatePluginNode(pluginMetadata, component);
@@ -811,6 +932,12 @@ function requireJsx () {
 	  const { generateJSXExpression } = requireExpressions();
 
 	  for (const child of children) {
+	    // Skip undefined/null children
+	    if (!child) {
+	      console.warn('[jsx.cjs] Skipping undefined child in children array');
+	      continue;
+	    }
+
 	    if (t.isJSXText(child)) {
 	      const text = child.value.trim();
 	      if (text) {
@@ -820,6 +947,10 @@ function requireJsx () {
 	      result.push({ type: 'element', code: generateJSXElement(child, component, indent + 1) });
 	    } else if (t.isJSXExpressionContainer(child)) {
 	      result.push({ type: 'expression', code: generateJSXExpression(child.expression, component, indent) });
+	    } else if (t.isJSXFragment(child)) {
+	      result.push({ type: 'element', code: generateFragment(child, component, indent + 1) });
+	    } else {
+	      console.warn(`[jsx.cjs] Unknown child type: ${child.type}`);
 	    }
 	  }
 
@@ -1150,15 +1281,92 @@ function requireExpressions () {
 	  const indexParam = callback.params[1] ? callback.params[1].name : null;
 	  const body = callback.body;
 
-	  const itemCode = t.isJSXElement(body)
-	    ? generateJSXElement(body, component, indent + 1)
-	    : generateJSXElement(body.body, component, indent + 1);
+	  // Track map context for event handler closure capture (nested maps)
+	  const previousMapContext = component ? component.currentMapContext : null;
+	  const previousParams = previousMapContext ? previousMapContext.params : [];
+	  const currentParams = indexParam ? [itemParam, indexParam] : [itemParam];
+	  if (component) {
+	    component.currentMapContext = { params: [...previousParams, ...currentParams] };
+	  }
+
+	  let itemCode;
+	  let hasBlockStatements = false;
+
+	  if (t.isJSXElement(body)) {
+	    // Direct JSX return: item => <div>...</div>
+	    itemCode = generateJSXElement(body, component, indent + 1);
+	  } else if (t.isBlockStatement(body)) {
+	    // Block statement: item => { const x = ...; return <div>...</div>; }
+	    // Need to generate a statement lambda in C#
+	    hasBlockStatements = true;
+
+	    const statements = [];
+	    let returnJSX = null;
+
+	    // Process all statements in the block
+	    for (const stmt of body.body) {
+	      if (t.isReturnStatement(stmt) && t.isJSXElement(stmt.argument)) {
+	        returnJSX = stmt.argument;
+	        // Don't add return statement to statements array yet
+	      } else if (t.isVariableDeclaration(stmt)) {
+	        // Convert variable declarations: const displayValue = item[field];
+	        for (const decl of stmt.declarations) {
+	          const varName = decl.id.name;
+	          const init = decl.init ? generateCSharpExpression(decl.init) : 'null';
+	          statements.push(`var ${varName} = ${init};`);
+	        }
+	      } else {
+	        // Other statements - convert them
+	        statements.push(generateCSharpStatement(stmt));
+	      }
+	    }
+
+	    if (!returnJSX) {
+	      console.error('[generateMapExpression] Block statement has no JSX return');
+	      throw new Error('Map callback with block statement must return JSX element');
+	    }
+
+	    const jsxCode = generateJSXElement(returnJSX, component, indent + 1);
+	    statements.push(`return ${jsxCode};`);
+
+	    itemCode = statements.join(' ');
+	  } else {
+	    console.error('[generateMapExpression] Unsupported callback body type:', body?.type);
+	    throw new Error(`Unsupported map callback body type: ${body?.type}`);
+	  }
+
+	  // Restore previous context
+	  if (component) {
+	    component.currentMapContext = previousMapContext;
+	  }
+
+	  // Check if array is dynamic (likely from outer .map())
+	  const needsCast = arrayName.includes('.') && !arrayName.match(/^[A-Z]/); // Property access, not static class
+	  const castedArray = needsCast ? `((IEnumerable<dynamic>)${arrayName})` : arrayName;
 
 	  // C# Select supports (item, index) => ...
-	  if (indexParam) {
-	    return `${arrayName}.Select((${itemParam}, ${indexParam}) => ${itemCode}).ToArray()`;
+	  if (hasBlockStatements) {
+	    // Use statement lambda: item => { statements; return jsx; }
+	    if (indexParam) {
+	      const lambdaExpr = `(${itemParam}, ${indexParam}) => { ${itemCode} }`;
+	      const castedLambda = needsCast ? `(Func<dynamic, int, dynamic>)(${lambdaExpr})` : lambdaExpr;
+	      return `${castedArray}.Select(${castedLambda}).ToArray()`;
+	    } else {
+	      const lambdaExpr = `${itemParam} => { ${itemCode} }`;
+	      const castedLambda = needsCast ? `(Func<dynamic, dynamic>)(${lambdaExpr})` : lambdaExpr;
+	      return `${castedArray}.Select(${castedLambda}).ToArray()`;
+	    }
 	  } else {
-	    return `${arrayName}.Select(${itemParam} => ${itemCode}).ToArray()`;
+	    // Use expression lambda: item => jsx
+	    if (indexParam) {
+	      const lambdaExpr = `(${itemParam}, ${indexParam}) => ${itemCode}`;
+	      const castedLambda = needsCast ? `(Func<dynamic, int, dynamic>)(${lambdaExpr})` : lambdaExpr;
+	      return `${castedArray}.Select(${castedLambda}).ToArray()`;
+	    } else {
+	      const lambdaExpr = `${itemParam} => ${itemCode}`;
+	      const castedLambda = needsCast ? `(Func<dynamic, dynamic>)(${lambdaExpr})` : lambdaExpr;
+	      return `${castedArray}.Select(${castedLambda}).ToArray()`;
+	    }
 	  }
 	}
 
@@ -1173,7 +1381,15 @@ function requireExpressions () {
 	  }
 
 	  if (t.isReturnStatement(node)) {
+	    // Handle empty return statement: return; (not return null;)
+	    if (node.argument === null || node.argument === undefined) {
+	      return 'return;';
+	    }
 	    return `return ${generateCSharpExpression(node.argument)};`;
+	  }
+
+	  if (t.isThrowStatement(node)) {
+	    return `throw ${generateCSharpExpression(node.argument)};`;
 	  }
 
 	  if (t.isVariableDeclaration(node)) {
@@ -1183,6 +1399,82 @@ function requireExpressions () {
 	      return `var ${name} = ${value};`;
 	    }).join(' ');
 	    return declarations;
+	  }
+
+	  if (t.isIfStatement(node)) {
+	    const test = generateCSharpExpression(node.test);
+	    let result = `if (${test}) {\n`;
+
+	    // Handle consequent (then branch)
+	    if (t.isBlockStatement(node.consequent)) {
+	      for (const stmt of node.consequent.body) {
+	        result += '    ' + generateCSharpStatement(stmt) + '\n';
+	      }
+	    } else {
+	      result += '    ' + generateCSharpStatement(node.consequent) + '\n';
+	    }
+
+	    result += '}';
+
+	    // Handle alternate (else branch) if it exists
+	    if (node.alternate) {
+	      result += ' else {\n';
+	      if (t.isBlockStatement(node.alternate)) {
+	        for (const stmt of node.alternate.body) {
+	          result += '    ' + generateCSharpStatement(stmt) + '\n';
+	        }
+	      } else if (t.isIfStatement(node.alternate)) {
+	        // else if
+	        result += '    ' + generateCSharpStatement(node.alternate) + '\n';
+	      } else {
+	        result += '    ' + generateCSharpStatement(node.alternate) + '\n';
+	      }
+	      result += '}';
+	    }
+
+	    return result;
+	  }
+
+	  if (t.isTryStatement(node)) {
+	    let result = 'try {\n';
+
+	    // Handle try block
+	    if (t.isBlockStatement(node.block)) {
+	      for (const stmt of node.block.body) {
+	        result += '    ' + generateCSharpStatement(stmt) + '\n';
+	      }
+	    }
+
+	    result += '}';
+
+	    // Handle catch clause
+	    if (node.handler) {
+	      const catchParam = node.handler.param ? node.handler.param.name : 'ex';
+	      result += ` catch (Exception ${catchParam}) {\n`;
+
+	      if (t.isBlockStatement(node.handler.body)) {
+	        for (const stmt of node.handler.body.body) {
+	          result += '    ' + generateCSharpStatement(stmt) + '\n';
+	        }
+	      }
+
+	      result += '}';
+	    }
+
+	    // Handle finally block
+	    if (node.finalizer) {
+	      result += ' finally {\n';
+
+	      if (t.isBlockStatement(node.finalizer)) {
+	        for (const stmt of node.finalizer.body) {
+	          result += '    ' + generateCSharpStatement(stmt) + '\n';
+	        }
+	      }
+
+	      result += '}';
+	    }
+
+	    return result;
 	  }
 
 	  // Fallback: try to convert as expression
@@ -1220,6 +1512,21 @@ function requireExpressions () {
 
 	  if (t.isIdentifier(node)) {
 	    return node.name;
+	  }
+
+	  if (t.isAwaitExpression(node)) {
+	    return `await ${generateCSharpExpression(node.argument, inInterpolation)}`;
+	  }
+
+	  // Handle TypeScript type assertions: (e.target as any) → e.target (strip the cast)
+	  // In C#, we rely on dynamic typing, so type casts are usually unnecessary
+	  if (t.isTSAsExpression(node)) {
+	    return generateCSharpExpression(node.expression, inInterpolation);
+	  }
+
+	  // Handle TypeScript type assertions (angle bracket syntax): <any>e.target → e.target
+	  if (t.isTSTypeAssertion(node)) {
+	    return generateCSharpExpression(node.expression, inInterpolation);
 	  }
 
 	  // Handle optional chaining: viewModel?.userEmail → viewModel?.UserEmail
@@ -1261,6 +1568,16 @@ function requireExpressions () {
 	      return `${object}.Checked`;
 	    }
 
+	    // Handle exception properties (err.message → err.Message)
+	    if (propertyName === 'message' && !node.computed) {
+	      return `${object}.Message`;
+	    }
+
+	    // Handle fetch Response properties (response.ok → response.IsSuccessStatusCode)
+	    if (propertyName === 'ok' && !node.computed) {
+	      return `${object}.IsSuccessStatusCode`;
+	    }
+
 	    const property = node.computed
 	      ? `[${generateCSharpExpression(node.property)}]`
 	      : `.${propertyName}`;
@@ -1268,8 +1585,49 @@ function requireExpressions () {
 	  }
 
 	  if (t.isArrayExpression(node)) {
+	    // Check if array contains spread elements
+	    const hasSpread = node.elements.some(e => t.isSpreadElement(e));
+
+	    if (hasSpread) {
+	      // Handle spread operator: [...array, item] → array.Concat(new[] { item }).ToList()
+	      const parts = [];
+	      let currentLiteral = [];
+
+	      for (const element of node.elements) {
+	        if (t.isSpreadElement(element)) {
+	          // Flush current literal elements
+	          if (currentLiteral.length > 0) {
+	            const literalCode = currentLiteral.map(e => generateCSharpExpression(e)).join(', ');
+	            parts.push(`new List<object> { ${literalCode} }`);
+	            currentLiteral = [];
+	          }
+	          // Add spread array
+	          parts.push(`((IEnumerable<object>)${generateCSharpExpression(element.argument)})`);
+	        } else {
+	          currentLiteral.push(element);
+	        }
+	      }
+
+	      // Flush remaining literals
+	      if (currentLiteral.length > 0) {
+	        const literalCode = currentLiteral.map(e => generateCSharpExpression(e)).join(', ');
+	        parts.push(`new List<object> { ${literalCode} }`);
+	      }
+
+	      // Combine with Concat
+	      if (parts.length === 1) {
+	        return `${parts[0]}.ToList()`;
+	      } else {
+	        const concats = parts.slice(1).map(p => `.Concat(${p})`).join('');
+	        return `${parts[0]}${concats}.ToList()`;
+	      }
+	    }
+
+	    // No spread - simple array literal
 	    const elements = node.elements.map(e => generateCSharpExpression(e)).join(', ');
-	    return `new List<object> { ${elements} }`;
+	    // Use List<dynamic> for empty arrays to be compatible with dynamic LINQ results
+	    const listType = elements.length === 0 ? 'dynamic' : 'object';
+	    return `new List<${listType}> { ${elements} }`;
 	  }
 
 	  if (t.isUnaryExpression(node)) {
@@ -1280,13 +1638,71 @@ function requireExpressions () {
 	  }
 
 	  if (t.isBinaryExpression(node)) {
-	    const left = generateCSharpExpression(node.left);
-	    const right = generateCSharpExpression(node.right);
+	    // Helper function to get operator precedence (higher = tighter binding)
+	    const getPrecedence = (op) => {
+	      if (op === '*' || op === '/' || op === '%') return 3;
+	      if (op === '+' || op === '-') return 2;
+	      if (op === '==' || op === '!=' || op === '===' || op === '!==' ||
+	          op === '<' || op === '>' || op === '<=' || op === '>=') return 1;
+	      return 0;
+	    };
+
+	    const currentPrecedence = getPrecedence(node.operator);
+
+	    // Generate left side, wrap in parentheses if needed
+	    let left = generateCSharpExpression(node.left);
+	    if (t.isBinaryExpression(node.left)) {
+	      const leftPrecedence = getPrecedence(node.left.operator);
+	      // Wrap in parentheses if left has lower precedence
+	      if (leftPrecedence < currentPrecedence) {
+	        left = `(${left})`;
+	      }
+	    }
+
+	    // Generate right side, wrap in parentheses if needed
+	    let right = generateCSharpExpression(node.right);
+	    if (t.isBinaryExpression(node.right)) {
+	      const rightPrecedence = getPrecedence(node.right.operator);
+	      // Wrap in parentheses if right has lower or equal precedence
+	      // Equal precedence on right needs parens for left-associative operators
+	      if (rightPrecedence <= currentPrecedence) {
+	        right = `(${right})`;
+	      }
+	    }
+
 	    // Convert JavaScript operators to C# operators
 	    let operator = node.operator;
 	    if (operator === '===') operator = '==';
 	    if (operator === '!==') operator = '!=';
 	    return `${left} ${operator} ${right}`;
+	  }
+
+	  if (t.isLogicalExpression(node)) {
+	    const left = generateCSharpExpression(node.left);
+	    const right = generateCSharpExpression(node.right);
+
+	    if (node.operator === '||') {
+	      // JavaScript: a || b
+	      // C#: a ?? b (null coalescing)
+	      return `(${left}) ?? (${right})`;
+	    } else if (node.operator === '&&') {
+	      // Check if right side is a boolean expression (comparison, logical, etc.)
+	      const rightIsBooleanExpr = t.isBinaryExpression(node.right) ||
+	                                  t.isLogicalExpression(node.right) ||
+	                                  t.isUnaryExpression(node.right);
+
+	      if (rightIsBooleanExpr) {
+	        // JavaScript: a && (b > 0)
+	        // C#: (a) && (b > 0) - boolean AND
+	        return `(${left}) && (${right})`;
+	      } else {
+	        // JavaScript: a && <jsx> or a && someValue
+	        // C#: a != null ? value : null (for objects)
+	        return `(${left}) != null ? (${right}) : null`;
+	      }
+	    }
+
+	    return `${left} ${node.operator} ${right}`;
 	  }
 
 	  if (t.isConditionalExpression(node)) {
@@ -1315,10 +1731,71 @@ function requireExpressions () {
 	      return `Math.Min(${args})`;
 	    }
 
+	    // Handle other Math methods (floor, ceil, round, pow, log, etc.) → Pascal case
+	    if (t.isMemberExpression(node.callee) &&
+	        t.isIdentifier(node.callee.object, { name: 'Math' })) {
+	      const methodName = node.callee.property.name;
+	      const pascalMethodName = methodName.charAt(0).toUpperCase() + methodName.slice(1);
+	      const args = node.arguments.map(arg => generateCSharpExpression(arg)).join(', ');
+
+	      // Cast floor/ceil/round to int for array indexing compatibility
+	      if (methodName === 'floor' || methodName === 'ceil' || methodName === 'round') {
+	        return `(int)Math.${pascalMethodName}(${args})`;
+	      }
+
+	      return `Math.${pascalMethodName}(${args})`;
+	    }
+
+	    // Handle encodeURIComponent() → Uri.EscapeDataString()
+	    if (t.isIdentifier(node.callee, { name: 'encodeURIComponent' })) {
+	      const args = node.arguments.map(arg => generateCSharpExpression(arg)).join(', ');
+	      return `Uri.EscapeDataString(${args})`;
+	    }
+
+	    // Handle fetch() → HttpClient call
+	    // Note: This generates a basic wrapper. Real implementation would use IHttpClientFactory
+	    if (t.isIdentifier(node.callee, { name: 'fetch' })) {
+	      const url = node.arguments.length > 0 ? generateCSharpExpression(node.arguments[0]) : '""';
+	      // Return HttpResponseMessage (await is handled by caller)
+	      return `new HttpClient().GetAsync(${url})`;
+	    }
+
+	    // Handle Promise.resolve(value) → Task.FromResult(value)
+	    if (t.isMemberExpression(node.callee) &&
+	        t.isIdentifier(node.callee.object, { name: 'Promise' }) &&
+	        t.isIdentifier(node.callee.property, { name: 'resolve' })) {
+	      if (node.arguments.length > 0) {
+	        const value = generateCSharpExpression(node.arguments[0]);
+	        return `Task.FromResult(${value})`;
+	      }
+	      return `Task.CompletedTask`;
+	    }
+
+	    // Handle Promise.reject(error) → Task.FromException(error)
+	    if (t.isMemberExpression(node.callee) &&
+	        t.isIdentifier(node.callee.object, { name: 'Promise' }) &&
+	        t.isIdentifier(node.callee.property, { name: 'reject' })) {
+	      if (node.arguments.length > 0) {
+	        const error = generateCSharpExpression(node.arguments[0]);
+	        return `Task.FromException(new Exception(${error}))`;
+	      }
+	    }
+
 	    // Handle alert() → Console.WriteLine() (or custom alert implementation)
 	    if (t.isIdentifier(node.callee, { name: 'alert' })) {
 	      const args = node.arguments.map(arg => generateCSharpExpression(arg)).join(' + ');
 	      return `Console.WriteLine(${args})`;
+	    }
+
+	    // Handle Object.keys() → dictionary.Keys or reflection for objects
+	    if (t.isMemberExpression(node.callee) &&
+	        t.isIdentifier(node.callee.object, { name: 'Object' }) &&
+	        t.isIdentifier(node.callee.property, { name: 'keys' })) {
+	      if (node.arguments.length > 0) {
+	        const obj = generateCSharpExpression(node.arguments[0]);
+	        // For dynamic objects, cast to IDictionary and get Keys
+	        return `((IDictionary<string, object>)${obj}).Keys`;
+	      }
 	    }
 
 	    // Handle console.log → Console.WriteLine
@@ -1329,13 +1806,54 @@ function requireExpressions () {
 	      return `Console.WriteLine(${args})`;
 	    }
 
+	    // Handle response.json() → response.Content.ReadFromJsonAsync<dynamic>()
+	    if (t.isMemberExpression(node.callee) && t.isIdentifier(node.callee.property, { name: 'json' })) {
+	      const object = generateCSharpExpression(node.callee.object);
+	      return `${object}.Content.ReadFromJsonAsync<dynamic>()`;
+	    }
+
 	    // Handle .toFixed(n) → .ToString("Fn")
 	    if (t.isMemberExpression(node.callee) && t.isIdentifier(node.callee.property, { name: 'toFixed' })) {
-	      const object = generateCSharpExpression(node.callee.object);
+	      let object = generateCSharpExpression(node.callee.object);
+
+	      // Preserve parentheses for complex expressions (binary operations, conditionals, etc.)
+	      // This ensures operator precedence is maintained: (price * quantity).toFixed(2) → (price * quantity).ToString("F2")
+	      if (t.isBinaryExpression(node.callee.object) ||
+	          t.isLogicalExpression(node.callee.object) ||
+	          t.isConditionalExpression(node.callee.object) ||
+	          t.isCallExpression(node.callee.object)) {
+	        object = `(${object})`;
+	      }
+
 	      const decimals = node.arguments.length > 0 && t.isNumericLiteral(node.arguments[0])
 	        ? node.arguments[0].value
 	        : 2;
 	      return `${object}.ToString("F${decimals}")`;
+	    }
+
+	    // Handle .toLocaleString() → .ToString("g") (DateTime)
+	    if (t.isMemberExpression(node.callee) && t.isIdentifier(node.callee.property, { name: 'toLocaleString' })) {
+	      const object = generateCSharpExpression(node.callee.object);
+	      return `${object}.ToString("g")`;
+	    }
+
+	    // Handle .toLowerCase() → .ToLower()
+	    if (t.isMemberExpression(node.callee) && t.isIdentifier(node.callee.property, { name: 'toLowerCase' })) {
+	      const object = generateCSharpExpression(node.callee.object);
+	      return `${object}.ToLower()`;
+	    }
+
+	    // Handle .toUpperCase() → .ToUpper()
+	    if (t.isMemberExpression(node.callee) && t.isIdentifier(node.callee.property, { name: 'toUpperCase' })) {
+	      const object = generateCSharpExpression(node.callee.object);
+	      return `${object}.ToUpper()`;
+	    }
+
+	    // Handle .substring(start, end) → .Substring(start, end)
+	    if (t.isMemberExpression(node.callee) && t.isIdentifier(node.callee.property, { name: 'substring' })) {
+	      const object = generateCSharpExpression(node.callee.object);
+	      const args = node.arguments.map(arg => generateCSharpExpression(arg)).join(', ');
+	      return `${object}.Substring(${args})`;
 	    }
 
 	    // Handle useState/useClientState setters → SetState calls
@@ -1352,23 +1870,196 @@ function requireExpressions () {
 	      }
 	    }
 
+	    // Handle .map() → .Select()
+	    if (t.isMemberExpression(node.callee) && t.isIdentifier(node.callee.property, { name: 'map' })) {
+	      const object = generateCSharpExpression(node.callee.object);
+	      if (node.arguments.length > 0) {
+	        const callback = node.arguments[0];
+	        if (t.isArrowFunctionExpression(callback)) {
+	          const paramNames = callback.params.map(p => p.name);
+	          // C# requires parentheses for 0 or 2+ parameters
+	          const params = paramNames.length === 1
+	            ? paramNames[0]
+	            : `(${paramNames.join(', ')})`;
+
+	          // Handle JSX in arrow function body
+	          let body;
+	          if (t.isBlockStatement(callback.body)) {
+	            body = `{ ${callback.body.body.map(stmt => generateCSharpStatement(stmt)).join(' ')} }`;
+	          } else if (t.isJSXElement(callback.body) || t.isJSXFragment(callback.body)) {
+	            // JSX element - use generateJSXElement with currentComponent context
+	            // Store map context for event handler closure capture
+	            // For nested maps, we need to ACCUMULATE params, not replace them
+	            const previousMapContext = currentComponent ? currentComponent.currentMapContext : null;
+	            const previousParams = previousMapContext ? previousMapContext.params : [];
+	            if (currentComponent) {
+	              // Combine previous params with current params for nested map support
+	              currentComponent.currentMapContext = { params: [...previousParams, ...paramNames] };
+	            }
+	            body = generateJSXElement(callback.body, currentComponent, 0);
+	            // Restore previous context
+	            if (currentComponent) {
+	              currentComponent.currentMapContext = previousMapContext;
+	            }
+	          } else {
+	            body = generateCSharpExpression(callback.body);
+	          }
+
+	          // Cast to IEnumerable<dynamic> if we detect dynamic access
+	          // Check for optional chaining or property access (likely dynamic)
+	          const needsCast = object.includes('?.') || object.includes('?') || object.includes('.');
+	          const castedObject = needsCast ? `((IEnumerable<dynamic>)${object})` : object;
+
+	          // If the object needs casting (is dynamic), we also need to cast the lambda
+	          // to prevent CS1977: "Cannot use a lambda expression as an argument to a dynamically dispatched operation"
+	          const lambdaExpr = `${params} => ${body}`;
+	          const castedLambda = needsCast ? `(Func<dynamic, dynamic>)(${lambdaExpr})` : lambdaExpr;
+
+	          return `${castedObject}.Select(${castedLambda}).ToList()`;
+	        }
+	      }
+	    }
+
 	    // Generic function call
 	    const callee = generateCSharpExpression(node.callee);
 	    const args = node.arguments.map(arg => generateCSharpExpression(arg)).join(', ');
 	    return `${callee}(${args})`;
 	  }
 
+	  if (t.isOptionalCallExpression(node)) {
+	    // Handle optional call: array?.map(...)
+	    // Check if this is .map() which needs to be converted to .Select()
+	    if (t.isOptionalMemberExpression(node.callee) &&
+	        t.isIdentifier(node.callee.property, { name: 'map' })) {
+	      const object = generateCSharpExpression(node.callee.object);
+	      if (node.arguments.length > 0) {
+	        const callback = node.arguments[0];
+	        if (t.isArrowFunctionExpression(callback)) {
+	          const paramNames = callback.params.map(p => p.name);
+	          // C# requires parentheses for 0 or 2+ parameters
+	          const params = paramNames.length === 1
+	            ? paramNames[0]
+	            : `(${paramNames.join(', ')})`;
+
+	          // Handle JSX in arrow function body
+	          let body;
+	          if (t.isBlockStatement(callback.body)) {
+	            body = `{ ${callback.body.body.map(stmt => generateCSharpStatement(stmt)).join(' ')} }`;
+	          } else if (t.isJSXElement(callback.body) || t.isJSXFragment(callback.body)) {
+	            // JSX element - use generateJSXElement with currentComponent context
+	            // Store map context for event handler closure capture
+	            // For nested maps, we need to ACCUMULATE params, not replace them
+	            const previousMapContext = currentComponent ? currentComponent.currentMapContext : null;
+	            const previousParams = previousMapContext ? previousMapContext.params : [];
+	            if (currentComponent) {
+	              // Combine previous params with current params for nested map support
+	              currentComponent.currentMapContext = { params: [...previousParams, ...paramNames] };
+	            }
+	            body = generateJSXElement(callback.body, currentComponent, 0);
+	            // Restore previous context
+	            if (currentComponent) {
+	              currentComponent.currentMapContext = previousMapContext;
+	            }
+	          } else {
+	            body = generateCSharpExpression(callback.body);
+	          }
+
+	          // Cast to IEnumerable<dynamic> for optional chaining (likely dynamic)
+	          const castedObject = `((IEnumerable<dynamic>)${object})`;
+
+	          // Cast result to List<dynamic> for ?? operator compatibility
+	          // Anonymous types from Select need explicit Cast<dynamic>() before ToList()
+	          return `${castedObject}?.Select(${params} => ${body})?.Cast<dynamic>().ToList()`;
+	        }
+	      }
+	    }
+
+	    // Generic optional call
+	    const callee = generateCSharpExpression(node.callee);
+	    const args = node.arguments.map(arg => generateCSharpExpression(arg)).join(', ');
+	    return `${callee}(${args})`;
+	  }
+
 	  if (t.isTemplateLiteral(node)) {
-	    // Convert template literal to C# string interpolation
+	    // Convert template literal to C# string
+
+	    // If no expressions, use verbatim string literal (@"...") to avoid escaping issues
+	    if (node.expressions.length === 0) {
+	      const text = node.quasis[0].value.raw;
+	      // Use verbatim string literal (@"...") for multiline or strings with special chars
+	      // Escape " as "" in verbatim strings
+	      const escaped = text.replace(/"/g, '""');
+	      return `@"${escaped}"`;
+	    }
+
+	    // Has expressions - use C# string interpolation
 	    let result = '$"';
 	    for (let i = 0; i < node.quasis.length; i++) {
-	      result += node.quasis[i].value.raw;
+	      // Escape special chars in C# interpolated strings
+	      let text = node.quasis[i].value.raw;
+	      // Escape { and } by doubling them
+	      text = text.replace(/{/g, '{{').replace(/}/g, '}}');
+	      // Escape " as \"
+	      text = text.replace(/"/g, '\\"');
+	      result += text;
+
 	      if (i < node.expressions.length) {
-	        result += '{' + generateCSharpExpression(node.expressions[i]) + '}';
+	        const expr = node.expressions[i];
+	        // Wrap conditional (ternary) expressions in parentheses to avoid ':' conflict in C# interpolation
+	        const exprCode = generateCSharpExpression(expr);
+	        const needsParens = t.isConditionalExpression(expr);
+	        result += '{' + (needsParens ? `(${exprCode})` : exprCode) + '}';
 	      }
 	    }
 	    result += '"';
 	    return result;
+	  }
+
+	  if (t.isNewExpression(node)) {
+	    // Handle new Promise(resolve => setTimeout(resolve, ms)) → Task.Delay(ms)
+	    if (t.isIdentifier(node.callee, { name: 'Promise' }) && node.arguments.length > 0) {
+	      const callback = node.arguments[0];
+
+	      // Check if it's the setTimeout pattern
+	      if (t.isArrowFunctionExpression(callback) && callback.params.length === 1) {
+	        const resolveParam = callback.params[0].name;
+	        const body = callback.body;
+
+	        // Check if body is: setTimeout(resolve, ms)
+	        if (t.isCallExpression(body) &&
+	            t.isIdentifier(body.callee, { name: 'setTimeout' }) &&
+	            body.arguments.length === 2 &&
+	            t.isIdentifier(body.arguments[0], { name: resolveParam })) {
+	          const delay = generateCSharpExpression(body.arguments[1]);
+	          return `Task.Delay(${delay})`;
+	        }
+	      }
+
+	      // Generic Promise constructor - not directly supported in C#
+	      // Return Task.CompletedTask as a fallback
+	      return `Task.CompletedTask`;
+	    }
+
+	    // Handle new Date() → DateTime.Parse()
+	    if (t.isIdentifier(node.callee, { name: 'Date' })) {
+	      if (node.arguments.length === 0) {
+	        return 'DateTime.Now';
+	      } else if (node.arguments.length === 1) {
+	        const arg = generateCSharpExpression(node.arguments[0]);
+	        return `DateTime.Parse(${arg})`;
+	      }
+	    }
+
+	    // Handle new Error() → new Exception()
+	    if (t.isIdentifier(node.callee, { name: 'Error' })) {
+	      const args = node.arguments.map(arg => generateCSharpExpression(arg)).join(', ');
+	      return `new Exception(${args})`;
+	    }
+
+	    // Handle other new expressions: new Foo() → new Foo()
+	    const callee = generateCSharpExpression(node.callee);
+	    const args = node.arguments.map(arg => generateCSharpExpression(arg)).join(', ');
+	    return `new ${callee}(${args})`;
 	  }
 
 	  if (t.isObjectExpression(node)) {
@@ -1405,6 +2096,32 @@ function requireExpressions () {
 	    } else {
 	      return `new { ${properties.join(', ')} }`;
 	    }
+	  }
+
+	  if (t.isArrowFunctionExpression(node) || t.isFunctionExpression(node)) {
+	    // Arrow function: (x) => x * 2  →  x => x * 2
+	    // Function expression: function(x) { return x * 2; }  →  x => x * 2
+	    const params = node.params.map(p => {
+	      if (t.isIdentifier(p)) return p.name;
+	      if (t.isObjectPattern(p)) return '{...}'; // Destructuring - simplified
+	      return 'param';
+	    }).join(', ');
+
+	    // Wrap params in parentheses if multiple or none
+	    const paramsString = node.params.length === 1 ? params : `(${params})`;
+
+	    // Generate function body
+	    let body;
+	    if (t.isBlockStatement(node.body)) {
+	      // Block body: (x) => { return x * 2; }
+	      const statements = node.body.body.map(stmt => generateCSharpStatement(stmt)).join(' ');
+	      body = `{ ${statements} }`;
+	    } else {
+	      // Expression body: (x) => x * 2
+	      body = generateCSharpExpression(node.body);
+	    }
+
+	    return `${paramsString} => ${body}`;
 	  }
 
 	  return 'null';
@@ -1846,7 +2563,7 @@ var useStateX = {
 
 const t$b = globalThis.__BABEL_TYPES__;
 const { generateCSharpExpression: generateCSharpExpression$2 } = requireExpressions();
-const { inferType, tsTypeToCSharpType: tsTypeToCSharpType$2 } = typeConversion;
+const { inferType, tsTypeToCSharpType: tsTypeToCSharpType$3 } = typeConversion;
 const { extractUseStateX } = useStateX;
 
 /**
@@ -1877,6 +2594,9 @@ function extractHook$1(path, component) {
       break;
     case 'useMarkdown':
       extractUseMarkdown(path, component);
+      break;
+    case 'useRazorMarkdown':
+      extractUseRazorMarkdown(path, component);
       break;
     case 'useTemplate':
       extractUseTemplate(path, component);
@@ -1938,17 +2658,23 @@ function extractUseState(path, component, hookType) {
   const [stateVar, setterVar] = parent.id.elements;
   const initialValue = path.node.arguments[0];
 
+  // Handle read-only state (no setter): const [value] = useState(...)
+  if (!stateVar) {
+    console.log(`[useState] Skipping invalid destructuring (no state variable)`);
+    return;
+  }
+
   // Check if there's a generic type parameter (e.g., useState<decimal>(0))
   let explicitType = null;
   if (path.node.typeParameters && path.node.typeParameters.params.length > 0) {
     const typeParam = path.node.typeParameters.params[0];
-    explicitType = tsTypeToCSharpType$2(typeParam);
+    explicitType = tsTypeToCSharpType$3(typeParam);
     console.log(`[useState] Found explicit type parameter for '${stateVar.name}': ${explicitType}`);
   }
 
   const stateInfo = {
     name: stateVar.name,
-    setter: setterVar.name,
+    setter: setterVar ? setterVar.name : null, // Setter is optional (read-only state)
     initialValue: generateCSharpExpression$2(initialValue),
     type: explicitType || inferType(initialValue) // Prefer explicit type over inferred
   };
@@ -2012,6 +2738,44 @@ function extractUseMarkdown(path, component) {
 
   // Track as markdown state type
   component.stateTypes.set(contentVar.name, 'markdown');
+}
+
+/**
+ * Extract useRazorMarkdown - markdown with Razor syntax
+ */
+function extractUseRazorMarkdown(path, component) {
+  const parent = path.parent;
+
+  if (!t$b.isVariableDeclarator(parent)) return;
+  if (!t$b.isArrayPattern(parent.id)) return;
+
+  const [contentVar, setterVar] = parent.id.elements;
+  const initialValue = path.node.arguments[0];
+
+  // Initialize useRazorMarkdown array if it doesn't exist
+  if (!component.useRazorMarkdown) {
+    component.useRazorMarkdown = [];
+  }
+
+  // Extract raw markdown string (for Razor conversion)
+  let rawMarkdown = '';
+  if (t$b.isStringLiteral(initialValue)) {
+    rawMarkdown = initialValue.value;
+  } else if (t$b.isTemplateLiteral(initialValue)) {
+    // Template literal - extract raw string
+    rawMarkdown = initialValue.quasis.map(q => q.value.raw).join('');
+  }
+
+  component.useRazorMarkdown.push({
+    name: contentVar.name,
+    setter: setterVar.name,
+    initialValue: rawMarkdown, // Store raw markdown for Razor conversion
+    hasRazorSyntax: true, // Will be determined by Razor detection later
+    referencedVariables: [] // Will be populated by Razor variable extraction
+  });
+
+  // Track as razor-markdown state type
+  component.stateTypes.set(contentVar.name, 'razor-markdown');
 }
 
 /**
@@ -2532,7 +3296,7 @@ function extractUseMvcState(path, component) {
   // Extract TypeScript generic type: useMvcState<string>('name')
   // But prefer the type from the ViewModel interface if available (more reliable)
   const typeParam = path.node.typeParameters?.params[0];
-  let csharpType = typeParam ? tsTypeToCSharpType$2(typeParam) : 'dynamic';
+  let csharpType = typeParam ? tsTypeToCSharpType$3(typeParam) : 'dynamic';
 
   // Try to find the actual type from the ViewModel interface
   const interfaceType = findViewModelPropertyType(path, propertyName);
@@ -2674,7 +3438,7 @@ function findViewModelPropertyType(path, propertyName, component) {
         const typeAnnotation = member.typeAnnotation?.typeAnnotation;
         console.log(`[findViewModelPropertyType] Found property ${propertyName}, typeAnnotation:`, typeAnnotation);
         if (typeAnnotation) {
-          const csharpType = tsTypeToCSharpType$2(typeAnnotation);
+          const csharpType = tsTypeToCSharpType$3(typeAnnotation);
           console.log(`[findViewModelPropertyType] Mapped ${propertyName} type to: ${csharpType}`);
           return csharpType;
         }
@@ -2692,6 +3456,7 @@ var hooks = {
   extractUseEffect,
   extractUseRef,
   extractUseMarkdown,
+  extractUseRazorMarkdown,
   extractUseTemplate,
   extractUseValidation,
   extractUseModal,
@@ -2714,7 +3479,7 @@ var hooks = {
 
 const t$a = globalThis.__BABEL_TYPES__;
 const { generateCSharpExpression: generateCSharpExpression$1 } = requireExpressions();
-const { tsTypeToCSharpType: tsTypeToCSharpType$1 } = typeConversion;
+const { tsTypeToCSharpType: tsTypeToCSharpType$2 } = typeConversion;
 
 /**
  * Check if an expression uses external libraries
@@ -2848,7 +3613,7 @@ function extractLocalVariables$1(path, component, types) {
       // Try to infer type from TypeScript annotation or initial value
       let varType = 'var'; // C# var for type inference
       if (declarator.id.typeAnnotation?.typeAnnotation) {
-        varType = tsTypeToCSharpType$1(declarator.id.typeAnnotation.typeAnnotation);
+        varType = tsTypeToCSharpType$2(declarator.id.typeAnnotation.typeAnnotation);
       }
 
       component.localVariables.push({
@@ -3102,6 +3867,264 @@ var propTypeInference = {
 const t$8 = globalThis.__BABEL_TYPES__;
 
 /**
+ * Shared helper: Extract identifiers from expression (module-level for reuse)
+ */
+function extractIdentifiersShared(expr, result) {
+  if (t$8.isIdentifier(expr)) {
+    result.push(expr.name);
+  } else if (t$8.isBinaryExpression(expr) || t$8.isLogicalExpression(expr)) {
+    extractIdentifiersShared(expr.left, result);
+    extractIdentifiersShared(expr.right, result);
+  } else if (t$8.isUnaryExpression(expr)) {
+    extractIdentifiersShared(expr.argument, result);
+  } else if (t$8.isMemberExpression(expr)) {
+    result.push(buildMemberPathShared(expr));
+  }
+}
+
+/**
+ * Shared helper: Build member expression path
+ */
+function buildMemberPathShared(expr) {
+  const parts = [];
+  let current = expr;
+
+  while (t$8.isMemberExpression(current)) {
+    if (t$8.isIdentifier(current.property)) {
+      parts.unshift(current.property.name);
+    }
+    current = current.object;
+  }
+
+  if (t$8.isIdentifier(current)) {
+    parts.unshift(current.name);
+  }
+
+  return parts.join('.');
+}
+
+/**
+ * Shared helper: Extract method call binding
+ * Handles: price.toFixed(2), text.toLowerCase(), etc.
+ */
+function extractMethodCallBindingShared(expr) {
+  const callee = expr.callee;
+
+  if (!t$8.isMemberExpression(callee) && !t$8.isOptionalMemberExpression(callee)) {
+    return null;
+  }
+
+  const methodName = t$8.isIdentifier(callee.property) ? callee.property.name : null;
+  if (!methodName) return null;
+
+  const transformMethods = [
+    'toFixed', 'toString', 'toLowerCase', 'toUpperCase',
+    'trim', 'trimStart', 'trimEnd'
+  ];
+
+  if (!transformMethods.includes(methodName)) {
+    return null;
+  }
+
+  let binding = null;
+  if (t$8.isMemberExpression(callee.object)) {
+    binding = buildMemberPathShared(callee.object);
+  } else if (t$8.isIdentifier(callee.object)) {
+    binding = callee.object.name;
+  } else if (t$8.isBinaryExpression(callee.object)) {
+    const identifiers = [];
+    extractIdentifiersShared(callee.object, identifiers);
+    binding = `__expr__:${identifiers.join(',')}`;
+  }
+
+  if (!binding) return null;
+
+  const args = expr.arguments.map(arg => {
+    if (t$8.isNumericLiteral(arg)) return arg.value;
+    if (t$8.isStringLiteral(arg)) return arg.value;
+    if (t$8.isBooleanLiteral(arg)) return arg.value;
+    return null;
+  }).filter(v => v !== null);
+
+  return {
+    transform: methodName,
+    binding: binding,
+    args: args
+  };
+}
+
+/**
+ * Check if expression is a .map() call (including chained calls like .filter().map())
+ */
+function isMapCallExpression(expr) {
+  if (!t$8.isCallExpression(expr)) {
+    return false;
+  }
+
+  // Check if it's a direct .map() call
+  if (t$8.isMemberExpression(expr.callee) &&
+      t$8.isIdentifier(expr.callee.property) &&
+      expr.callee.property.name === 'map') {
+    return true;
+  }
+
+  // Check if it's a chained call ending in .map()
+  // e.g., items.filter(...).map(...), items.slice(0, 10).map(...)
+  let current = expr;
+  while (t$8.isCallExpression(current)) {
+    if (t$8.isMemberExpression(current.callee) &&
+        t$8.isIdentifier(current.callee.property) &&
+        current.callee.property.name === 'map') {
+      return true;
+    }
+    // Move to the next call in the chain
+    if (t$8.isMemberExpression(current.callee)) {
+      current = current.callee.object;
+    } else {
+      break;
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Shared helper: Extract binding from expression
+ */
+function extractBindingShared(expr, component) {
+  if (t$8.isIdentifier(expr)) {
+    return expr.name;
+  } else if (t$8.isMemberExpression(expr)) {
+    return buildMemberPathShared(expr);
+  } else if (t$8.isCallExpression(expr)) {
+    // First try method call binding (toFixed, etc.)
+    const methodBinding = extractMethodCallBindingShared(expr);
+    if (methodBinding) {
+      return methodBinding;
+    }
+
+    // Otherwise, handle chained method calls: todo.text.substring(0, 10).toUpperCase()
+    return extractComplexCallExpression(expr);
+  } else if (t$8.isBinaryExpression(expr)) {
+    // Handle binary expressions: todo.priority + 1, price * quantity, etc.
+    return extractBinaryExpressionBinding(expr);
+  } else if (t$8.isLogicalExpression(expr)) {
+    // Handle logical expressions: todo.dueDate || 'No due date'
+    return extractLogicalExpressionBinding(expr);
+  } else if (t$8.isUnaryExpression(expr)) {
+    // Handle unary expressions: !todo.completed
+    return extractUnaryExpressionBinding(expr);
+  } else {
+    return null;
+  }
+}
+
+/**
+ * Extract binding from binary expression
+ * Examples: todo.priority + 1, price * quantity, index * 2 + 1
+ */
+function extractBinaryExpressionBinding(expr) {
+  const identifiers = [];
+  extractIdentifiersShared(expr, identifiers);
+
+  // Use __expr__ prefix to indicate this is a computed expression
+  return `__expr__:${identifiers.join(',')}`;
+}
+
+/**
+ * Extract binding from logical expression
+ * Examples: todo.dueDate || 'No due date', condition && value
+ */
+function extractLogicalExpressionBinding(expr) {
+  const identifiers = [];
+  extractIdentifiersShared(expr, identifiers);
+
+  // Use __expr__ prefix to indicate this is a computed expression
+  return `__expr__:${identifiers.join(',')}`;
+}
+
+/**
+ * Extract binding from unary expression
+ * Examples: !todo.completed, -value
+ */
+function extractUnaryExpressionBinding(expr) {
+  const identifiers = [];
+  extractIdentifiersShared(expr, identifiers);
+
+  // Use __expr__ prefix to indicate this is a computed expression
+  return `__expr__:${identifiers.join(',')}`;
+}
+
+/**
+ * Extract binding from complex call expression (non-transform methods)
+ * Examples: todo.text.substring(0, 10).toUpperCase(), array.concat(other)
+ */
+function extractComplexCallExpression(expr) {
+  const identifiers = [];
+  extractIdentifiersShared(expr, identifiers);
+
+  if (identifiers.length === 0) {
+    return null;
+  }
+
+  // Use __expr__ prefix to indicate this is a computed expression
+  return `__expr__:${identifiers.join(',')}`;
+}
+
+/**
+ * Shared helper: Extract template literal (module-level for reuse)
+ */
+function extractTemplateLiteralShared(node, component) {
+  let templateStr = '';
+  const bindings = [];
+  const slots = [];
+  const transforms = [];
+  const conditionals = [];
+
+  for (let i = 0; i < node.quasis.length; i++) {
+    const quasi = node.quasis[i];
+    templateStr += quasi.value.raw;
+
+    if (i < node.expressions.length) {
+      const expr = node.expressions[i];
+      slots.push(templateStr.length);
+      templateStr += `{${i}}`;
+
+      const binding = extractBindingShared(expr);
+
+      if (binding && typeof binding === 'object' && binding.transform) {
+        bindings.push(binding.binding);
+        transforms.push({
+          slotIndex: i,
+          method: binding.transform,
+          args: binding.args
+        });
+      } else if (binding) {
+        bindings.push(binding);
+      } else {
+        bindings.push('__complex__');
+      }
+    }
+  }
+
+  const result = {
+    template: templateStr,
+    bindings,
+    slots,
+    type: 'attribute'
+  };
+
+  if (transforms.length > 0) {
+    result.transforms = transforms;
+  }
+  if (conditionals.length > 0) {
+    result.conditionals = conditionals;
+  }
+
+  return result;
+}
+
+/**
  * Extract all templates from JSX render body
  *
  * Returns a map of node paths to templates:
@@ -3156,7 +4179,7 @@ function extractTemplates$1(renderBody, component) {
           // Only create text template if this is actual text content, not structural JSX
           const expr = child.expression;
 
-          // Skip structural JSX (elements, fragments, conditionals with JSX, comments)
+          // Skip structural JSX (elements, fragments, conditionals with JSX, comments, .map() calls)
           const isStructural = t$8.isJSXElement(expr) ||
                                t$8.isJSXFragment(expr) ||
                                t$8.isJSXEmptyExpression(expr) || // Comments: {/* ... */}
@@ -3164,7 +4187,10 @@ function extractTemplates$1(renderBody, component) {
                                 (t$8.isJSXElement(expr.right) || t$8.isJSXFragment(expr.right))) ||
                                (t$8.isConditionalExpression(expr) &&
                                 (t$8.isJSXElement(expr.consequent) || t$8.isJSXElement(expr.alternate) ||
-                                 t$8.isJSXFragment(expr.consequent) || t$8.isJSXFragment(expr.alternate)));
+                                 t$8.isJSXFragment(expr.consequent) || t$8.isJSXFragment(expr.alternate))) ||
+                               // Skip .map() calls - they return arrays of JSX elements
+                               // Also handles chained calls like .filter().map(), .slice().map()
+                               isMapCallExpression(expr);
 
           if (!isStructural) {
             // This is a text expression, extract template
@@ -3211,6 +4237,33 @@ function extractTemplates$1(renderBody, component) {
         templateStr += text;
       } else if (t$8.isJSXExpressionContainer(child)) {
         hasExpressions = true;
+
+        // Special case: Template literal inside JSX expression container
+        // Example: {`${(discount * 100).toFixed(0)}%`}
+        if (t$8.isTemplateLiteral(child.expression)) {
+          const templateResult = extractTemplateLiteralShared(child.expression);
+          if (templateResult) {
+            // Merge the template literal's content into the current template
+            templateStr += templateResult.template;
+            // Add the template literal's bindings
+            for (const binding of templateResult.bindings) {
+              bindings.push(binding);
+            }
+            // Store transforms and conditionals if present
+            if (templateResult.transforms && templateResult.transforms.length > 0) {
+              transformMetadata = templateResult.transforms[0]; // Simplified: take first transform
+            }
+            if (templateResult.conditionals && templateResult.conditionals.length > 0) {
+              conditionalTemplates = {
+                true: templateResult.conditionals[0].trueValue,
+                false: templateResult.conditionals[0].falseValue
+              };
+            }
+            paramIndex++;
+            continue; // Skip normal binding extraction
+          }
+        }
+
         const binding = extractBinding(child.expression);
 
         if (binding && typeof binding === 'object' && binding.conditional) {
@@ -3422,6 +4475,12 @@ function extractTemplates$1(renderBody, component) {
       binding = buildOptionalMemberPath(callee.object);
     } else if (t$8.isIdentifier(callee.object)) {
       binding = callee.object.name;
+    } else if (t$8.isBinaryExpression(callee.object)) {
+      // Handle expressions like (discount * 100).toFixed(0)
+      // Extract all identifiers from the binary expression
+      const identifiers = [];
+      extractIdentifiers(callee.object, identifiers);
+      binding = `__expr__:${identifiers.join(',')}`;
     }
 
     if (!binding) {
@@ -3565,7 +4624,7 @@ function extractAttributeTemplates$1(renderBody, component) {
 
           // Template literal: className={`count-${count}`}
           if (t$8.isTemplateLiteral(expr)) {
-            const template = extractTemplateLiteral(expr);
+            const template = extractTemplateLiteralShared(expr);
             if (template) {
               const attrPath = `${tagName}[${currentPath.join(',')}].@${attr.name.name}`;
               templates[attrPath] = {
@@ -3585,36 +4644,6 @@ function extractAttributeTemplates$1(renderBody, component) {
         }
       }
     }
-  }
-
-  function extractTemplateLiteral(node) {
-    let templateStr = '';
-    const bindings = [];
-    const slots = [];
-
-    for (let i = 0; i < node.quasis.length; i++) {
-      const quasi = node.quasis[i];
-      templateStr += quasi.value.raw;
-
-      if (i < node.expressions.length) {
-        const expr = node.expressions[i];
-        slots.push(templateStr.length);
-        templateStr += `{${i}}`;
-
-        if (t$8.isIdentifier(expr)) {
-          bindings.push(expr.name);
-        } else {
-          bindings.push('__complex__');
-        }
-      }
-    }
-
-    return {
-      template: templateStr,
-      bindings,
-      slots,
-      type: 'attribute'
-    };
   }
 
   if (renderBody) {
@@ -3838,14 +4867,14 @@ function extractLoopTemplates$1(renderBody, component) {
     }
 
     // Extract item template from JSX element
-    const itemTemplate = extractElementTemplate(jsxElement, itemVar);
+    const itemTemplate = extractElementTemplate(jsxElement, itemVar, indexVar);
     if (!itemTemplate) {
       console.warn('[Loop Template] Could not extract item template from JSX');
       return null;
     }
 
     // Extract key binding
-    const keyBinding = extractKeyBinding(jsxElement, itemVar);
+    const keyBinding = extractKeyBinding(jsxElement, itemVar, indexVar);
 
     return {
       stateKey: arrayBinding,  // For C# attribute: which state variable triggers this template
@@ -3932,7 +4961,7 @@ function extractLoopTemplates$1(renderBody, component) {
    *
    * Example: <li key={todo.id}> → "item.id"
    */
-  function extractKeyBinding(jsxElement, itemVar) {
+  function extractKeyBinding(jsxElement, itemVar, indexVar) {
     const keyAttr = jsxElement.openingElement.attributes.find(
       attr => t$7.isJSXAttribute(attr) &&
               t$7.isIdentifier(attr.name) &&
@@ -3943,7 +4972,7 @@ function extractLoopTemplates$1(renderBody, component) {
 
     const keyValue = keyAttr.value;
     if (t$7.isJSXExpressionContainer(keyValue)) {
-      return buildBindingPath(keyValue.expression, itemVar);
+      return buildBindingPath(keyValue.expression, itemVar, indexVar);
     } else if (t$7.isStringLiteral(keyValue)) {
       return null; // Static key (not based on item data)
     }
@@ -3969,12 +4998,16 @@ function extractLoopTemplates$1(renderBody, component) {
     // Extract prop templates
     const propsTemplates = extractPropTemplates(
       jsxElement.openingElement.attributes,
-      itemVar);
+      itemVar,
+      indexVar
+    );
 
     // Extract children templates
     const childrenTemplates = extractChildrenTemplates(
       jsxElement.children,
-      itemVar);
+      itemVar,
+      indexVar
+    );
 
     return {
       type: 'Element',
@@ -4022,7 +5055,7 @@ function extractLoopTemplates$1(renderBody, component) {
 
         // Conditional: {todo.done ? 'active' : 'inactive'}
         if (t$7.isConditionalExpression(expr)) {
-          const conditionalTemplate = extractConditionalTemplate(expr, itemVar);
+          const conditionalTemplate = extractConditionalTemplate(expr, itemVar, indexVar);
           if (conditionalTemplate) {
             templates[propName] = conditionalTemplate;
             continue;
@@ -4031,7 +5064,7 @@ function extractLoopTemplates$1(renderBody, component) {
 
         // Template literal: {`item-${todo.id}`}
         if (t$7.isTemplateLiteral(expr)) {
-          const template = extractTemplateFromTemplateLiteral(expr, itemVar);
+          const template = extractTemplateFromTemplateLiteral(expr, itemVar, indexVar);
           if (template) {
             templates[propName] = template;
             continue;
@@ -4039,7 +5072,7 @@ function extractLoopTemplates$1(renderBody, component) {
         }
 
         // Simple binding: {todo.text}, {todo.done}
-        const binding = buildBindingPath(expr, itemVar);
+        const binding = buildBindingPath(expr, itemVar, indexVar);
         if (binding) {
           templates[propName] = {
             template: '{0}',
@@ -4072,7 +5105,7 @@ function extractLoopTemplates$1(renderBody, component) {
     const alternate = conditionalExpr.alternate;
 
     // Extract binding from test expression
-    const binding = buildBindingPath(test, itemVar);
+    const binding = buildBindingPath(test, itemVar, indexVar);
     if (!binding) return null;
 
     // Extract literal values from consequent and alternate
@@ -4119,7 +5152,7 @@ function extractLoopTemplates$1(renderBody, component) {
 
       if (i < templateLiteral.expressions.length) {
         const expr = templateLiteral.expressions[i];
-        const binding = buildBindingPath(expr, itemVar);
+        const binding = buildBindingPath(expr, itemVar, indexVar);
 
         if (binding) {
           slots.push(templateStr.length);
@@ -4165,7 +5198,7 @@ function extractLoopTemplates$1(renderBody, component) {
 
       // Expression: <li>{todo.text}</li>
       if (t$7.isJSXExpressionContainer(child)) {
-        const template = extractTextTemplate(child.expression, itemVar);
+        const template = extractTextTemplate(child.expression, itemVar, indexVar);
         if (template) {
           templates.push(template);
         }
@@ -4174,7 +5207,7 @@ function extractLoopTemplates$1(renderBody, component) {
 
       // Nested element: <li><span>{todo.text}</span></li>
       if (t$7.isJSXElement(child)) {
-        const elementTemplate = extractElementTemplate(child, itemVar);
+        const elementTemplate = extractElementTemplate(child, itemVar, indexVar);
         if (elementTemplate) {
           templates.push(elementTemplate);
         }
@@ -4191,12 +5224,25 @@ function extractLoopTemplates$1(renderBody, component) {
    * Handles:
    * - Simple binding: {todo.text} → { template: "{0}", bindings: ["item.text"] }
    * - Conditional: {todo.done ? '✓' : '○'} → conditional template
-   * - Complex: {todo.count + 1} → transformation template (future)
+   * - Binary expressions: {todo.count + 1} → expression template
+   * - Method calls: {todo.text.toUpperCase()} → expression template
+   * - Logical expressions: {todo.date || 'N/A'} → expression template
    */
   function extractTextTemplate(expr, itemVar, indexVar) {
+    // Template literal: {`${user.firstName} ${user.lastName}`}
+    if (t$7.isTemplateLiteral(expr)) {
+      const templateLiteralResult = extractTemplateFromTemplateLiteral(expr, itemVar, indexVar);
+      if (templateLiteralResult) {
+        return {
+          type: 'Text',
+          ...templateLiteralResult
+        };
+      }
+    }
+
     // Conditional expression: {todo.done ? '✓' : '○'}
     if (t$7.isConditionalExpression(expr)) {
-      const conditionalTemplate = extractConditionalTemplate(expr, itemVar);
+      const conditionalTemplate = extractConditionalTemplate(expr, itemVar, indexVar);
       if (conditionalTemplate) {
         return {
           type: 'Text',
@@ -4205,8 +5251,8 @@ function extractLoopTemplates$1(renderBody, component) {
       }
     }
 
-    // Simple binding: {todo.text}
-    const binding = buildBindingPath(expr, itemVar);
+    // Try to extract binding (handles simple, binary, method calls, etc.)
+    const binding = buildBindingPath(expr, itemVar, indexVar);
     if (binding) {
       return {
         type: 'Text',
@@ -4216,7 +5262,7 @@ function extractLoopTemplates$1(renderBody, component) {
       };
     }
 
-    // TODO: Handle binary expressions (todo.count + 1), method calls (todo.text.toUpperCase()), etc.
+    // No binding found
     return null;
   }
 
@@ -4228,15 +5274,18 @@ function extractLoopTemplates$1(renderBody, component) {
    * - todo.text → "item.text"
    * - todo.author.name → "item.author.name"
    * - index → "index"
+   * - todo.priority + 1 → "__expr__:item.priority"
+   * - todo.text.toUpperCase() → "__expr__:item.text"
+   * - index * 2 + 1 → "__expr__:index"
    */
-  function buildBindingPath(expr, itemVar) {
+  function buildBindingPath(expr, itemVar, indexVar) {
     if (t$7.isIdentifier(expr)) {
       // Just the item variable itself
       if (expr.name === itemVar) {
         return null; // Can't template the entire item object
       }
       // Index variable
-      if (expr.name === 'index') {
+      if (expr.name === 'index' || expr.name === indexVar) {
         return 'index';
       }
       // Other identifier (likely a closure variable)
@@ -4251,7 +5300,136 @@ function extractLoopTemplates$1(renderBody, component) {
       }
     }
 
+    // Handle binary expressions: todo.priority + 1, price * quantity, etc.
+    if (t$7.isBinaryExpression(expr)) {
+      return extractLoopBinaryExpression(expr, itemVar, indexVar);
+    }
+
+    // Handle logical expressions: todo.dueDate || 'No due date'
+    if (t$7.isLogicalExpression(expr)) {
+      return extractLoopLogicalExpression(expr, itemVar, indexVar);
+    }
+
+    // Handle unary expressions: !todo.completed, -value
+    if (t$7.isUnaryExpression(expr)) {
+      return extractLoopUnaryExpression(expr, itemVar, indexVar);
+    }
+
+    // Handle call expressions: todo.text.toUpperCase(), array.concat()
+    if (t$7.isCallExpression(expr)) {
+      return extractLoopCallExpression(expr, itemVar, indexVar);
+    }
+
     return null;
+  }
+
+  /**
+   * Extract binding from binary expression in loop
+   * Examples: todo.priority + 1, price * quantity, index * 2 + 1
+   */
+  function extractLoopBinaryExpression(expr, itemVar, indexVar) {
+    const identifiers = [];
+    extractLoopIdentifiers(expr, identifiers, itemVar, indexVar);
+
+    if (identifiers.length === 0) {
+      return null;
+    }
+
+    // Use __expr__ prefix to indicate this is a computed expression
+    return `__expr__:${identifiers.join(',')}`;
+  }
+
+  /**
+   * Extract binding from logical expression in loop
+   * Examples: todo.dueDate || 'No due date', condition && value
+   */
+  function extractLoopLogicalExpression(expr, itemVar, indexVar) {
+    const identifiers = [];
+    extractLoopIdentifiers(expr, identifiers, itemVar, indexVar);
+
+    if (identifiers.length === 0) {
+      return null;
+    }
+
+    // Use __expr__ prefix to indicate this is a computed expression
+    return `__expr__:${identifiers.join(',')}`;
+  }
+
+  /**
+   * Extract binding from unary expression in loop
+   * Examples: !todo.completed, -value
+   */
+  function extractLoopUnaryExpression(expr, itemVar, indexVar) {
+    const identifiers = [];
+    extractLoopIdentifiers(expr, identifiers, itemVar, indexVar);
+
+    if (identifiers.length === 0) {
+      return null;
+    }
+
+    // Use __expr__ prefix to indicate this is a computed expression
+    return `__expr__:${identifiers.join(',')}`;
+  }
+
+  /**
+   * Extract binding from call expression in loop
+   * Examples: todo.text.toUpperCase(), todo.text.substring(0, 10)
+   */
+  function extractLoopCallExpression(expr, itemVar, indexVar) {
+    const identifiers = [];
+    extractLoopIdentifiers(expr, identifiers, itemVar, indexVar);
+
+    if (identifiers.length === 0) {
+      return null;
+    }
+
+    // Use __expr__ prefix to indicate this is a computed expression
+    return `__expr__:${identifiers.join(',')}`;
+  }
+
+  /**
+   * Extract identifiers from expression, converting item references to "item" prefix
+   */
+  function extractLoopIdentifiers(expr, result, itemVar, indexVar) {
+    if (t$7.isIdentifier(expr)) {
+      if (expr.name === itemVar) {
+        // Don't add raw item variable
+        return;
+      } else if (expr.name === 'index' || expr.name === indexVar) {
+        result.push('index');
+      } else {
+        result.push(expr.name);
+      }
+    } else if (t$7.isBinaryExpression(expr) || t$7.isLogicalExpression(expr)) {
+      extractLoopIdentifiers(expr.left, result, itemVar, indexVar);
+      extractLoopIdentifiers(expr.right, result, itemVar, indexVar);
+    } else if (t$7.isUnaryExpression(expr)) {
+      extractLoopIdentifiers(expr.argument, result, itemVar, indexVar);
+    } else if (t$7.isMemberExpression(expr)) {
+      const path = buildMemberExpressionPath(expr);
+      if (path) {
+        if (path.startsWith(itemVar + '.')) {
+          // Replace item variable with "item" prefix
+          result.push('item' + path.substring(itemVar.length));
+        } else {
+          result.push(path);
+        }
+      } else {
+        // Complex member expression (e.g., (a + b).toFixed())
+        // Extract from both object and property
+        extractLoopIdentifiers(expr.object, result, itemVar, indexVar);
+        if (t$7.isIdentifier(expr.property)) {
+          result.push(expr.property.name);
+        }
+      }
+    } else if (t$7.isCallExpression(expr)) {
+      // Extract from callee
+      extractLoopIdentifiers(expr.callee, result, itemVar, indexVar);
+      // Extract from arguments
+      for (const arg of expr.arguments) {
+        extractLoopIdentifiers(arg, result, itemVar, indexVar);
+      }
+    }
   }
 
   /**
@@ -4980,10 +6158,26 @@ function extractExpressionTemplates$1(renderBody, component) {
    * }
    */
   function extractMemberExpressionTemplate(memberExpr, component, path) {
+    // Check for computed property access: item[field]
+    if (memberExpr.computed) {
+      console.warn('[Minimact Warning] Computed property access detected - skipping template optimization (requires runtime evaluation)');
+
+      // Return a special marker indicating this needs runtime evaluation
+      // The C# generator will handle this as dynamic property access
+      return {
+        type: 'computedMemberExpression',
+        isComputed: true,
+        requiresRuntimeEval: true,
+        object: memberExpr.object,
+        property: memberExpr.property,
+        path
+      };
+    }
+
     const binding = buildMemberPath(memberExpr);
     if (!binding) return null;
 
-    // Get property name
+    // Get property name (only for non-computed properties)
     const propertyName = memberExpr.property.name;
 
     // Check if it's a supported property
@@ -5462,7 +6656,7 @@ var analyzePluginUsage_1 = {
 
 const t$3 = globalThis.__BABEL_TYPES__;
 const { getComponentName } = helpers;
-const { tsTypeToCSharpType } = typeConversion;
+const { tsTypeToCSharpType: tsTypeToCSharpType$1 } = typeConversion;
 const { extractHook } = hooks;
 const { extractLocalVariables } = localVariables;
 const { inferPropTypes } = propTypeInference;
@@ -5503,6 +6697,7 @@ function processComponent$1(path, state) {
     useDropdown: [],
     eventHandlers: [],
     localVariables: [], // Local variables (const/let/var) in function body
+    helperFunctions: [], // Helper functions declared in function body
     renderBody: null,
     pluginUsages: [], // Plugin instances (<Plugin name="..." state={...} />)
     stateTypes: new Map(), // Track which hook each state came from
@@ -5562,7 +6757,7 @@ function processComponent$1(path, state) {
                      member.key.name === propName
           );
           if (tsProperty && tsProperty.typeAnnotation) {
-            propType = tsTypeToCSharpType(tsProperty.typeAnnotation.typeAnnotation);
+            propType = tsTypeToCSharpType$1(tsProperty.typeAnnotation.typeAnnotation);
           }
         }
 
@@ -5596,6 +6791,38 @@ function processComponent$1(path, state) {
       // Only extract local variables at the top level of the function body
       if (varPath.getFunctionParent() === path && varPath.parent.type === 'BlockStatement') {
         extractLocalVariables(varPath, component, t$3);
+      }
+    },
+
+    FunctionDeclaration(funcPath) {
+      // Only extract helper functions at the top level of the component body
+      // (not nested functions inside other functions)
+      if (funcPath.getFunctionParent() === path && funcPath.parent.type === 'BlockStatement') {
+        const funcName = funcPath.node.id.name;
+        const params = funcPath.node.params.map(param => {
+          if (t$3.isIdentifier(param)) {
+            // Simple parameter: (name)
+            const paramType = param.typeAnnotation?.typeAnnotation
+              ? tsTypeToCSharpType$1(param.typeAnnotation.typeAnnotation)
+              : 'dynamic';
+            return { name: param.name, type: paramType };
+          }
+          return { name: 'param', type: 'dynamic' };
+        });
+
+        const returnType = funcPath.node.returnType?.typeAnnotation
+          ? tsTypeToCSharpType$1(funcPath.node.returnType.typeAnnotation)
+          : 'void';
+
+        const isAsync = funcPath.node.async;
+
+        component.helperFunctions.push({
+          name: funcName,
+          params,
+          returnType,
+          isAsync,
+          body: funcPath.node.body // Store the function body AST
+        });
       }
     },
 
@@ -5652,11 +6879,13 @@ function processComponent$1(path, state) {
       console.log(`[Minimact Expression Templates] Extracted ${expressionTemplates.length} expression templates from ${componentName}:`);
       expressionTemplates.forEach(et => {
         if (et.method) {
-          console.log(`  - ${et.binding}.${et.method}(${et.args.join(', ')})`);
+          console.log(`  - ${et.binding}.${et.method}(${et.args?.join(', ') || ''})`);
         } else if (et.operator) {
           console.log(`  - ${et.operator}${et.binding}`);
-        } else {
+        } else if (et.bindings) {
           console.log(`  - ${et.bindings.join(', ')}`);
+        } else {
+          console.log(`  - ${JSON.stringify(et)}`);
         }
       });
     }
@@ -5673,6 +6902,40 @@ function processComponent$1(path, state) {
       pluginUsages.forEach(plugin => {
         const versionInfo = plugin.version ? ` v${plugin.version}` : '';
         console.log(`  - <Plugin name="${plugin.pluginName}"${versionInfo} state={${plugin.stateBinding.binding}} />`);
+      });
+    }
+  }
+
+  // Detect which top-level helper functions are referenced by this component
+  if (state.file.topLevelFunctions && state.file.topLevelFunctions.length > 0) {
+    const referencedFunctionNames = new Set();
+
+    // Traverse the component to find all function calls
+    path.traverse({
+      CallExpression(callPath) {
+        if (t$3.isIdentifier(callPath.node.callee)) {
+          const funcName = callPath.node.callee.name;
+          // Check if this matches a top-level function
+          const helperFunc = state.file.topLevelFunctions.find(f => f.name === funcName);
+          if (helperFunc) {
+            referencedFunctionNames.add(funcName);
+          }
+        }
+      }
+    });
+
+    // Add referenced functions to component's topLevelHelperFunctions array
+    component.topLevelHelperFunctions = state.file.topLevelFunctions
+      .filter(f => referencedFunctionNames.has(f.name))
+      .map(f => ({
+        name: f.name,
+        node: f.node
+      }));
+
+    if (component.topLevelHelperFunctions.length > 0) {
+      console.log(`[Minimact Helpers] Component '${componentName}' references ${component.topLevelHelperFunctions.length} helper function(s):`);
+      component.topLevelHelperFunctions.forEach(f => {
+        console.log(`  - ${f.name}()`);
       });
     }
   }
@@ -5789,6 +7052,9 @@ function transpileStatement(statement) {
     const declarations = statement.declarations.map(decl => {
       const name = decl.id.name;
       const init = decl.init ? transpileExpression(decl.init) : 'null';
+      if (name === 'chartData') {
+        console.log(`[DEBUG chartData] init type: ${decl.init?.type}, result: ${init}`);
+      }
       return `var ${name} = ${init};`;
     });
     return declarations.join('\n');
@@ -5918,11 +7184,31 @@ function transpileExpression(expr) {
     return transpileMemberExpression(fullExpr, object, property);
   }
 
+  if (t$1.isOptionalMemberExpression(expr)) {
+    const object = transpileExpression(expr.object);
+    const property = expr.computed
+      ? `[${transpileExpression(expr.property)}]`
+      : `.${expr.property.name}`;
+
+    // In C#, optional chaining (?.) is just ?.
+    const fullExpr = `${object}?${property}`;
+    return transpileMemberExpression(fullExpr, object, property);
+  }
+
   if (t$1.isCallExpression(expr)) {
     const callee = transpileExpression(expr.callee);
     const args = expr.arguments.map(arg => transpileExpression(arg)).join(', ');
 
     // Handle special method calls
+    return transpileMethodCall(callee, args);
+  }
+
+  if (t$1.isOptionalCallExpression(expr)) {
+    const callee = transpileExpression(expr.callee);
+    const args = expr.arguments.map(arg => transpileExpression(arg)).join(', ');
+
+    // In C#, optional call (?.) is handled via null-conditional operator
+    // The callee should already have ? from OptionalMemberExpression
     return transpileMethodCall(callee, args);
   }
 
@@ -5957,6 +7243,11 @@ function transpileExpression(expr) {
       ? `{\n${indent$1(transpileBlockStatement(expr.body), 4)}\n}`
       : transpileExpression(expr.body);
     return `(${params}) => ${body}`;
+  }
+
+  if (t$1.isParenthesizedExpression(expr)) {
+    // Unwrap parentheses - just transpile the inner expression
+    return transpileExpression(expr.expression);
   }
 
   if (t$1.isBinaryExpression(expr)) {
@@ -6010,6 +7301,7 @@ function transpileExpression(expr) {
     return expr.prefix ? `${operator}${argument}` : `${argument}${operator}`;
   }
 
+  console.warn(`[transpileExpression] Unknown expression type: ${expr.type}`);
   return `/* TODO: ${expr.type} */`;
 }
 
@@ -6271,6 +7563,296 @@ var serverTask = {
 };
 
 /**
+ * Razor Markdown to C# Conversion
+ *
+ * Converts Razor-style syntax in markdown to C# string interpolation.
+ *
+ * Input (TSX):
+ *   `# @name - $@price`
+ *
+ * Output (C#):
+ *   $@"# {name} - ${price}"
+ *
+ * Supported conversions:
+ * - @variable → {variable}
+ * - @variable.Property → {variable.Property}
+ * - @(expression) → {(expression)}
+ * - @if (cond) { ... } else { ... } → {(cond ? @"..." : @"...")}
+ * - @foreach (var x in xs) { ... } → {string.Join("\n", xs.Select(x => $@"..."))}
+ * - @for (var i = 1; i <= count; i++) { ... } → {string.Join("\n", Enumerable.Range(1, count).Select(i => $@"..."))}
+ * - @switch (x) { case ...: ... } → {x switch { ... => @"...", _ => @"..." }}
+ */
+
+var razorMarkdown;
+var hasRequiredRazorMarkdown;
+
+function requireRazorMarkdown () {
+	if (hasRequiredRazorMarkdown) return razorMarkdown;
+	hasRequiredRazorMarkdown = 1;
+	/**
+	 * Convert Razor markdown to C# interpolated string
+	 *
+	 * @param {string} razorMarkdown - Markdown with Razor syntax
+	 * @returns {string} C# interpolated string ($@"...")
+	 */
+	function convertRazorMarkdownToCSharp(razorMarkdown) {
+	  if (!razorMarkdown || typeof razorMarkdown !== 'string') {
+	    return '$@""';
+	  }
+
+	  let markdown = razorMarkdown;
+
+	  // Step 1: Convert @if blocks (must come before variable references)
+	  markdown = convertIfBlocks(markdown);
+
+	  // Step 2: Convert @foreach blocks
+	  markdown = convertForeachBlocks(markdown);
+
+	  // Step 3: Convert @for blocks
+	  markdown = convertForBlocks(markdown);
+
+	  // Step 4: Convert @switch blocks
+	  markdown = convertSwitchBlocks(markdown);
+
+	  // Step 5: Convert @(expression)
+	  markdown = convertInlineExpressions(markdown);
+
+	  // Step 6: Convert @variableName (must come last)
+	  markdown = convertVariableReferences(markdown);
+
+	  // Step 7: Escape any remaining unescaped quotes
+	  // Already handled by nested verbatim strings (@"...")
+
+	  // Step 8: Wrap in $@"..."
+	  return `$@"${markdown}"`;
+	}
+
+	/**
+	 * Convert @if blocks to C# ternary expressions
+	 *
+	 * @if (condition) { body } → {(condition ? @"body" : "")}
+	 * @if (condition) { body } else { elseBody } → {(condition ? @"body" : @"elseBody")}
+	 *
+	 * @param {string} markdown
+	 * @returns {string}
+	 */
+	function convertIfBlocks(markdown) {
+	  // Pattern: @if \s* ( condition ) \s* { body } [else { elseBody }]
+	  // Using [\s\S] to match any character including newlines
+
+	  const ifPattern = /@if\s*\(([^)]+)\)\s*\{([\s\S]*?)\}(?:\s*else\s*\{([\s\S]*?)\})?/g;
+
+	  return markdown.replace(ifPattern, (match, condition, thenBody, elseBody) => {
+	    const then = thenBody.trim();
+	    const elsePart = elseBody ? elseBody.trim() : '';
+
+	    // Recursively convert nested Razor in the bodies
+	    const convertedThen = convertNestedRazor(then);
+	    const convertedElse = elsePart ? convertNestedRazor(elsePart) : '';
+
+	    if (convertedElse) {
+	      return `{(${condition} ? @"${convertedThen}" : @"${convertedElse}")}`;
+	    } else {
+	      return `{(${condition} ? @"${convertedThen}" : "")}`;
+	    }
+	  });
+	}
+
+	/**
+	 * Convert @foreach blocks to LINQ Select
+	 *
+	 * @foreach (var item in collection) { body } →
+	 * {string.Join("\n", collection.Select(item => $@"body"))}
+	 *
+	 * @param {string} markdown
+	 * @returns {string}
+	 */
+	function convertForeachBlocks(markdown) {
+	  // Pattern: @foreach \s* ( var itemVar in collection ) \s* { body }
+	  // Using [\s\S] to match any character including newlines
+	  const foreachPattern = /@foreach\s*\(\s*var\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+in\s+([a-zA-Z_][a-zA-Z0-9_.]*)\)\s*\{([\s\S]*?)\}/g;
+
+	  return markdown.replace(foreachPattern, (match, itemVar, collection, body) => {
+	    const bodyTrimmed = body.trim();
+	    // Recursively convert nested Razor in body (preserving item variable references)
+	    const convertedBody = convertNestedRazor(bodyTrimmed, itemVar);
+
+	    return `{string.Join("\\n", ${collection}.Select(${itemVar} => $@"${convertedBody}"))}`;
+	  });
+	}
+
+	/**
+	 * Convert @for blocks to Enumerable.Range
+	 *
+	 * @for (var i = 1; i <= count; i++) { body } →
+	 * {string.Join("\n", Enumerable.Range(1, count).Select(i => $@"body"))}
+	 *
+	 * @param {string} markdown
+	 * @returns {string}
+	 */
+	function convertForBlocks(markdown) {
+	  // Pattern: @for ( var indexVar = start; indexVar <= end; indexVar++ ) { body }
+	  // Using [\s\S] to match any character including newlines
+	  // End can be either a number or a variable name
+	  const forPattern = /@for\s*\(\s*var\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(\d+)\s*;\s*\1\s*<=?\s*([a-zA-Z_0-9][a-zA-Z0-9_.]*)\s*;\s*\1\+\+\s*\)\s*\{([\s\S]*?)\}/g;
+
+	  return markdown.replace(forPattern, (match, indexVar, start, end, body) => {
+	    const bodyTrimmed = body.trim();
+	    const convertedBody = convertNestedRazor(bodyTrimmed, indexVar);
+
+	    // Enumerable.Range(start, count) where count = end - start + 1
+	    // But if end is a variable, we need: Enumerable.Range(start, end - start + 1)
+	    const isEndNumeric = /^\d+$/.test(end);
+	    const count = isEndNumeric
+	      ? (parseInt(end) - parseInt(start) + 1).toString()
+	      : `${end} - ${start} + 1`;
+
+	    return `{string.Join("\\n", Enumerable.Range(${start}, ${count}).Select(${indexVar} => $@"${convertedBody}"))}`;
+	  });
+	}
+
+	/**
+	 * Convert @switch blocks to C# switch expressions
+	 *
+	 * @switch (expr) { case "x": body break; default: defaultBody break; } →
+	 * {expr switch { "x" => @"body", _ => @"defaultBody" }}
+	 *
+	 * @param {string} markdown
+	 * @returns {string}
+	 */
+	function convertSwitchBlocks(markdown) {
+	  const switchPattern = /@switch\s*\(([^)]+)\)\s*\{([\s\S]*?)\}/g;
+
+	  return markdown.replace(switchPattern, (match, expr, cases) => {
+	    const switchCases = [];
+
+	    // Match case patterns: case pattern: body break;
+	    const casePattern = /case\s+(.*?):([\s\S]*?)(?=break;)/g;
+	    const caseMatches = [...cases.matchAll(casePattern)];
+
+	    for (const caseMatch of caseMatches) {
+	      const pattern = caseMatch[1].trim();
+	      const body = caseMatch[2].trim();
+
+	      // Recursively convert nested Razor in body
+	      const convertedBody = convertNestedRazor(body);
+
+	      // Check if pattern contains 'var' (pattern guard)
+	      // e.g., "var q when q < 5"
+	      if (pattern.startsWith('var ')) {
+	        // Pattern guard - use $@"..." for interpolation
+	        switchCases.push(`${pattern} => $@"${convertedBody}"`);
+	      } else {
+	        // Simple pattern - use @"..." (no interpolation needed unless body has @)
+	        switchCases.push(`${pattern} => @"${convertedBody}"`);
+	      }
+	    }
+
+	    // Match default case: default: body break;
+	    const defaultMatch = cases.match(/default:([\s\S]*?)(?=break;)/);
+	    if (defaultMatch) {
+	      const body = defaultMatch[1].trim();
+	      const convertedBody = convertNestedRazor(body);
+	      switchCases.push(`_ => @"${convertedBody}"`);
+	    }
+
+	    return `{${expr} switch { ${switchCases.join(', ')} }}`;
+	  });
+	}
+
+	/**
+	 * Convert @(expression) to {(expression)}
+	 *
+	 * @param {string} markdown
+	 * @returns {string}
+	 */
+	function convertInlineExpressions(markdown) {
+	  // Convert @(expression) → {(expression)}
+	  return markdown.replace(/@\(([^)]+)\)/g, '{($1)}');
+	}
+
+	/**
+	 * Convert @variableName to {variableName}
+	 *
+	 * @param {string} markdown
+	 * @returns {string}
+	 */
+	function convertVariableReferences(markdown) {
+	  // Convert @variableName → {variableName}
+	  // Convert @variable.Property → {variable.Property}
+	  // Convert @variable.Method() → {variable.Method()}
+
+	  // Pattern: @ followed by identifier, with optional property/method chain
+	  // But skip Razor keywords (already converted)
+	  const keywords = ['if', 'else', 'foreach', 'for', 'while', 'switch'];
+
+	  return markdown.replace(/@([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*|\([^)]*\))*)/g, (match, varPath) => {
+	    const rootVar = varPath.split(/[.(]/)[0];
+
+	    // Skip Razor keywords (shouldn't happen - already converted)
+	    if (keywords.includes(rootVar)) {
+	      return match;
+	    }
+
+	    return `{${varPath}}`;
+	  });
+	}
+
+	/**
+	 * Recursively convert nested Razor syntax within bodies
+	 *
+	 * Used for converting Razor inside @if, @foreach, @for, @switch bodies
+	 *
+	 * @param {string} body - Body text that may contain nested Razor
+	 * @param {string} [itemVar] - Loop item variable to preserve (for @foreach, @for)
+	 * @returns {string} Body with Razor converted to C# interpolation placeholders
+	 */
+	function convertNestedRazor(body, itemVar = null) {
+	  let result = body;
+
+	  // Step 1: Convert @(expression)
+	  result = result.replace(/@\(([^)]+)\)/g, '{($1)}');
+
+	  // Step 2: If itemVar provided, convert @itemVar references
+	  if (itemVar) {
+	    // Convert @itemVar.property or @itemVar
+	    const itemPattern = new RegExp(`@${itemVar}(\\.[a-zA-Z_][a-zA-Z0-9_]*|\\([^)]*\\))*`, 'g');
+	    result = result.replace(itemPattern, (match) => {
+	      return `{${match.substring(1)}}`; // Remove @ and wrap in {}
+	    });
+	  }
+
+	  // Step 3: Convert other @variable references
+	  result = result.replace(/@([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*|\([^)]*\))*)/g, (match, varPath) => {
+	    // Don't double-convert itemVar (already done above)
+	    if (itemVar && varPath.startsWith(itemVar)) {
+	      return match;
+	    }
+
+	    return `{${varPath}}`;
+	  });
+
+	  // Step 4: Escape quotes in the body for C# verbatim strings
+	  // Replace " with "" for @"..." strings
+	  result = result.replace(/"/g, '""');
+
+	  return result;
+	}
+
+	razorMarkdown = {
+	  convertRazorMarkdownToCSharp,
+	  convertIfBlocks,
+	  convertForeachBlocks,
+	  convertForBlocks,
+	  convertSwitchBlocks,
+	  convertInlineExpressions,
+	  convertVariableReferences,
+	  convertNestedRazor
+	};
+	return razorMarkdown;
+}
+
+/**
  * Component Generator
  */
 
@@ -6422,6 +8004,17 @@ function generateComponent$1(component) {
     lines.push(`    [State]`);
     lines.push(`    private string ${md.name} = ${md.initialValue};`);
     lines.push('');
+  }
+
+  // Razor Markdown fields (useRazorMarkdown)
+  // These are initialized in OnInitialized() after Razor syntax is evaluated
+  if (component.useRazorMarkdown) {
+    for (const md of component.useRazorMarkdown) {
+      lines.push(`    [RazorMarkdown]`);
+      lines.push(`    [State]`);
+      lines.push(`    private string ${md.name} = null!;`);
+      lines.push('');
+    }
   }
 
   // Validation fields (useValidation)
@@ -6640,16 +8233,35 @@ function generateComponent$1(component) {
 
     // Generate parameter list
     const params = handler.params || [];
-    const paramStr = params.length > 0
-      ? params.map(p => t.isIdentifier(p) ? `dynamic ${p.name}` : 'dynamic arg').join(', ')
-      : '';
+    let paramList = params.length > 0
+      ? params.map(p => t.isIdentifier(p) ? `dynamic ${p.name}` : 'dynamic arg')
+      : [];
+
+    // Add captured parameters from .map() context (e.g., item, index)
+    const capturedParams = handler.capturedParams || [];
+    if (capturedParams.length > 0) {
+      paramList = paramList.concat(capturedParams.map(p => `dynamic ${p}`));
+    }
+
+    const paramStr = paramList.join(', ');
 
     // Event handlers must be public so SignalR hub can call them
-    lines.push(`    public void ${handler.name}(${paramStr})`);
+    // Use async Task if handler contains await
+    const returnType = handler.isAsync ? 'async Task' : 'void';
+    lines.push(`    public ${returnType} ${handler.name}(${paramStr})`);
     lines.push('    {');
 
+    // Check if this is a curried function error
+    if (handler.isCurriedError) {
+      lines.push(`        throw new InvalidOperationException(`);
+      lines.push(`            "Event handler '${handler.name}' returns a function instead of executing an action. " +`);
+      lines.push(`            "This is a curried function pattern (e.g., (e) => (id) => action(id)) which is invalid for event handlers. " +`);
+      lines.push(`            "The returned function is never called by the event system. " +`);
+      lines.push(`            "Fix: Use (e) => action(someValue) or create a properly bound handler."`);
+      lines.push(`        );`);
+    }
     // Generate method body
-    if (handler.body) {
+    else if (handler.body) {
       if (t.isBlockStatement(handler.body)) {
         // Block statement: { ... }
         for (const statement of handler.body.body) {
@@ -6742,6 +8354,95 @@ function generateComponent$1(component) {
         lines.push(`        SetState("${mvcState.propertyName}", value);`);
         lines.push('    }');
       }
+    }
+  }
+
+  // OnInitialized method for Razor Markdown initialization
+  if (component.useRazorMarkdown && component.useRazorMarkdown.length > 0) {
+    const { convertRazorMarkdownToCSharp } = requireRazorMarkdown();
+
+    lines.push('');
+    lines.push('    protected override void OnInitialized()');
+    lines.push('    {');
+    lines.push('        base.OnInitialized();');
+    lines.push('');
+
+    for (const md of component.useRazorMarkdown) {
+      // Convert Razor markdown to C# string interpolation
+      const csharpMarkdown = convertRazorMarkdownToCSharp(md.initialValue);
+      lines.push(`        ${md.name} = ${csharpMarkdown};`);
+    }
+
+    lines.push('    }');
+  }
+
+  // Helper functions (function declarations in component body)
+  if (component.helperFunctions && component.helperFunctions.length > 0) {
+    for (const func of component.helperFunctions) {
+      lines.push('');
+
+      const returnType = func.isAsync
+        ? (func.returnType === 'void' ? 'async Task' : `async Task<${func.returnType}>`)
+        : func.returnType;
+
+      const params = (func.params || []).map(p => `${p.type} ${p.name}`).join(', ');
+
+      lines.push(`    private ${returnType} ${func.name}(${params})`);
+      lines.push('    {');
+
+      // Generate function body
+      if (func.body && t.isBlockStatement(func.body)) {
+        for (const statement of func.body.body) {
+          const stmtCode = generateCSharpStatement(statement, 2);
+          lines.push(stmtCode);
+        }
+      }
+
+      lines.push('    }');
+    }
+  }
+
+  // Helper functions (standalone functions referenced by component)
+  if (component.topLevelHelperFunctions && component.topLevelHelperFunctions.length > 0) {
+    for (const helper of component.topLevelHelperFunctions) {
+      lines.push('');
+      lines.push(`    // Helper function: ${helper.name}`);
+
+      // Generate the function signature
+      const func = helper.node;
+      const params = (func.params || []).map(p => {
+        // Get parameter type from TypeScript annotation
+        let paramType = 'dynamic';
+        if (p.typeAnnotation && p.typeAnnotation.typeAnnotation) {
+          paramType = tsTypeToCSharpType(p.typeAnnotation.typeAnnotation);
+        }
+        return `${paramType} ${p.name}`;
+      }).join(', ');
+
+      // Get return type from TypeScript annotation
+      let returnType = 'dynamic';
+      if (func.returnType && func.returnType.typeAnnotation) {
+        returnType = tsTypeToCSharpType(func.returnType.typeAnnotation);
+      }
+
+      lines.push(`    private static ${returnType} ${helper.name}(${params})`);
+      lines.push('    {');
+
+      // Generate function body
+      if (t.isBlockStatement(func.body)) {
+        for (const statement of func.body.body) {
+          const csharpStmt = generateCSharpStatement(statement);
+          if (csharpStmt) {
+            lines.push(`        ${csharpStmt}`);
+          }
+        }
+      } else {
+        // Expression body (arrow function)
+        const csharpExpr = generateCSharpExpression(func.body);
+        lines.push(`        return ${csharpExpr};`);
+      }
+
+      lines.push('    }');
     }
   }
 
@@ -6909,6 +8610,28 @@ var indexFull = function(babel) {
 
     visitor: {
       Program: {
+        enter(path, state) {
+          // Collect all top-level function declarations for potential inclusion as helpers
+          state.file.topLevelFunctions = [];
+
+          path.traverse({
+            FunctionDeclaration(funcPath) {
+              // Only collect top-level functions (not nested inside components)
+              if (funcPath.parent.type === 'Program' || funcPath.parent.type === 'ExportNamedDeclaration') {
+                const funcName = funcPath.node.id ? funcPath.node.id.name : null;
+                // Skip if it's a component (starts with uppercase)
+                if (funcName && funcName[0] === funcName[0].toLowerCase()) {
+                  state.file.topLevelFunctions.push({
+                    name: funcName,
+                    node: funcPath.node,
+                    path: funcPath
+                  });
+                }
+              }
+            }
+          });
+        },
+
         exit(path, state) {
           if (state.file.minimactComponents && state.file.minimactComponents.length > 0) {
             const csharpCode = generateCSharpFile(state.file.minimactComponents, state);

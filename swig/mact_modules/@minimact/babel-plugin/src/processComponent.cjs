@@ -47,6 +47,7 @@ function processComponent(path, state) {
     useDropdown: [],
     eventHandlers: [],
     localVariables: [], // Local variables (const/let/var) in function body
+    helperFunctions: [], // Helper functions declared in function body
     renderBody: null,
     pluginUsages: [], // Plugin instances (<Plugin name="..." state={...} />)
     stateTypes: new Map(), // Track which hook each state came from
@@ -143,6 +144,38 @@ function processComponent(path, state) {
       }
     },
 
+    FunctionDeclaration(funcPath) {
+      // Only extract helper functions at the top level of the component body
+      // (not nested functions inside other functions)
+      if (funcPath.getFunctionParent() === path && funcPath.parent.type === 'BlockStatement') {
+        const funcName = funcPath.node.id.name;
+        const params = funcPath.node.params.map(param => {
+          if (t.isIdentifier(param)) {
+            // Simple parameter: (name)
+            const paramType = param.typeAnnotation?.typeAnnotation
+              ? tsTypeToCSharpType(param.typeAnnotation.typeAnnotation)
+              : 'dynamic';
+            return { name: param.name, type: paramType };
+          }
+          return { name: 'param', type: 'dynamic' };
+        });
+
+        const returnType = funcPath.node.returnType?.typeAnnotation
+          ? tsTypeToCSharpType(funcPath.node.returnType.typeAnnotation)
+          : 'void';
+
+        const isAsync = funcPath.node.async;
+
+        component.helperFunctions.push({
+          name: funcName,
+          params,
+          returnType,
+          isAsync,
+          body: funcPath.node.body // Store the function body AST
+        });
+      }
+    },
+
     ReturnStatement(returnPath) {
       if (returnPath.getFunctionParent() === path) {
         // Deep clone the AST node to preserve it before we replace JSX with null
@@ -196,11 +229,13 @@ function processComponent(path, state) {
       console.log(`[Minimact Expression Templates] Extracted ${expressionTemplates.length} expression templates from ${componentName}:`);
       expressionTemplates.forEach(et => {
         if (et.method) {
-          console.log(`  - ${et.binding}.${et.method}(${et.args.join(', ')})`);
+          console.log(`  - ${et.binding}.${et.method}(${et.args?.join(', ') || ''})`);
         } else if (et.operator) {
           console.log(`  - ${et.operator}${et.binding}`);
-        } else {
+        } else if (et.bindings) {
           console.log(`  - ${et.bindings.join(', ')}`);
+        } else {
+          console.log(`  - ${JSON.stringify(et)}`);
         }
       });
     }
@@ -217,6 +252,40 @@ function processComponent(path, state) {
       pluginUsages.forEach(plugin => {
         const versionInfo = plugin.version ? ` v${plugin.version}` : '';
         console.log(`  - <Plugin name="${plugin.pluginName}"${versionInfo} state={${plugin.stateBinding.binding}} />`);
+      });
+    }
+  }
+
+  // Detect which top-level helper functions are referenced by this component
+  if (state.file.topLevelFunctions && state.file.topLevelFunctions.length > 0) {
+    const referencedFunctionNames = new Set();
+
+    // Traverse the component to find all function calls
+    path.traverse({
+      CallExpression(callPath) {
+        if (t.isIdentifier(callPath.node.callee)) {
+          const funcName = callPath.node.callee.name;
+          // Check if this matches a top-level function
+          const helperFunc = state.file.topLevelFunctions.find(f => f.name === funcName);
+          if (helperFunc) {
+            referencedFunctionNames.add(funcName);
+          }
+        }
+      }
+    });
+
+    // Add referenced functions to component's topLevelHelperFunctions array
+    component.topLevelHelperFunctions = state.file.topLevelFunctions
+      .filter(f => referencedFunctionNames.has(f.name))
+      .map(f => ({
+        name: f.name,
+        node: f.node
+      }));
+
+    if (component.topLevelHelperFunctions.length > 0) {
+      console.log(`[Minimact Helpers] Component '${componentName}' references ${component.topLevelHelperFunctions.length} helper function(s):`);
+      component.topLevelHelperFunctions.forEach(f => {
+        console.log(`  - ${f.name}()`);
       });
     }
   }

@@ -4155,8 +4155,18 @@ var Minimact = (function (exports) {
                 // Build args object
                 const argsObj = {};
                 // Add parsed args from handler string
+                // Args may be JSON strings that need parsing (e.g., "{\"name\":\"file.txt\"}")
                 if (handler.args.length > 0) {
-                    argsObj.args = handler.args;
+                    argsObj.args = handler.args.map((arg) => {
+                        try {
+                            // Try to parse as JSON (for objects/arrays)
+                            return JSON.parse(arg);
+                        }
+                        catch {
+                            // If not JSON, return as-is (for simple strings/numbers)
+                            return arg;
+                        }
+                    });
                 }
                 // Add event data
                 if (event instanceof MouseEvent) {

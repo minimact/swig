@@ -1497,8 +1497,18 @@ var Minimact = (function (exports) {
                 // Build args object
                 const argsObj = {};
                 // Add parsed args from handler string
+                // Args may be JSON strings that need parsing (e.g., "{\"name\":\"file.txt\"}")
                 if (handler.args.length > 0) {
-                    argsObj.args = handler.args;
+                    argsObj.args = handler.args.map((arg) => {
+                        try {
+                            // Try to parse as JSON (for objects/arrays)
+                            return JSON.parse(arg);
+                        }
+                        catch {
+                            // If not JSON, return as-is (for simple strings/numbers)
+                            return arg;
+                        }
+                    });
                 }
                 // Add event data
                 if (event instanceof MouseEvent) {
@@ -3749,6 +3759,43 @@ var Minimact = (function (exports) {
         }
         return context.serverReducers.get(reducerKey);
     }
+    /**
+     * useMarkdown hook - for markdown content that gets parsed to HTML on server
+     *
+     * Pattern: const [content, setContent] = useMarkdown('# Hello World');
+     *
+     * Server-side behavior:
+     * - Babel transpiles this to [Markdown][State] string field
+     * - Server renders markdown → HTML via MarkdownHelper.ToHtml()
+     * - JSX references get wrapped in DivRawHtml(MarkdownHelper.ToHtml(content))
+     *
+     * Client-side behavior:
+     * - Behaves exactly like useState<string>
+     * - Receives pre-rendered HTML in patches from server
+     * - State changes sync to server (which re-renders markdown to HTML)
+     *
+     * Example:
+     * ```tsx
+     * const [content, setContent] = useMarkdown('# Title\n\n**Bold text**');
+     *
+     * return (
+     *   <div>
+     *     {content}  // Server renders as: <h1>Title</h1><p><strong>Bold text</strong></p>
+     *   </div>
+     * );
+     * ```
+     *
+     * @param initialValue - Initial markdown string
+     * @returns Tuple of [content, setContent] where content is markdown string
+     */
+    function useMarkdown(initialValue) {
+        // useMarkdown is just useState<string> on the client
+        // The magic happens on the server:
+        // 1. Babel recognizes useMarkdown and marks field as [Markdown]
+        // 2. JSX transpiler wraps references in MarkdownHelper.ToHtml()
+        // 3. Server sends pre-rendered HTML to client
+        return useState(initialValue);
+    }
 
     /**
      * useContext - Server-side cache system with multiple scope types
@@ -4335,6 +4382,93 @@ var Minimact = (function (exports) {
     }
 
     /**
+     * Hook: useSignalR
+     * Connects to a SignalR hub using the lightweight SignalM client
+     *
+     * This is the SignalM-based implementation of useSignalR.
+     * It connects to server-side SignalR hubs but uses the lightweight SignalM client.
+     * Bundle size: ~3 KB vs 15 KB for full SignalR client.
+     *
+     * Usage:
+     * const notifications = useSignalR('/minimact', (message) => {
+     *   console.log('New notification:', message);
+     * });
+     */
+    function useSignalR(hubUrl, onMessage, options = {}) {
+        // Create SignalM manager for this hub (lightweight client for SignalR server)
+        const manager = new SignalMManager(hubUrl, {
+            reconnectInterval: options.reconnectInterval,
+            debugLogging: options.debugLogging
+        });
+        // Initialize state
+        const state = {
+            data: null,
+            error: null,
+            connected: false,
+            connectionId: null
+        };
+        // Setup event handlers
+        manager.on('connected', ({ connectionId }) => {
+            state.connected = true;
+            state.connectionId = connectionId || null;
+            state.error = null;
+        });
+        manager.on('reconnected', ({ connectionId }) => {
+            state.connected = true;
+            state.connectionId = connectionId || null;
+            state.error = null;
+        });
+        manager.on('closed', ({ error }) => {
+            state.connected = false;
+            state.connectionId = null;
+            if (error) {
+                state.error = error.toString();
+            }
+        });
+        manager.on('error', ({ message }) => {
+            state.error = message;
+        });
+        // Setup message handler if provided
+        if (onMessage) {
+            manager.on('message', (data) => {
+                state.data = data;
+                onMessage(data);
+            });
+        }
+        // Auto-connect if enabled (default: true)
+        if (options.autoConnect !== false) {
+            manager.start().catch(error => {
+                state.error = error.message;
+                console.error('[Minimact useSignalR] Auto-connect failed:', error);
+            });
+        }
+        return {
+            state,
+            send: async (methodName, ...args) => {
+                try {
+                    await manager.invoke(methodName, ...args);
+                }
+                catch (error) {
+                    state.error = error.message;
+                    throw error;
+                }
+            },
+            on: (methodName, handler) => {
+                manager.on(methodName, handler);
+            },
+            off: (methodName, handler) => {
+                manager.off(methodName, handler);
+            },
+            connect: async () => {
+                await manager.start();
+            },
+            disconnect: async () => {
+                await manager.stop();
+            }
+        };
+    }
+
+    /**
      * Main Minimact client runtime
      * Orchestrates SignalM (lightweight WebSocket), DOM patching, state management, and hydration
      *
@@ -4636,12 +4770,14 @@ var Minimact = (function (exports) {
     exports.useEffect = useEffect;
     exports.useIdleCallback = useIdleCallback;
     exports.useMacroTask = useMacroTask;
+    exports.useMarkdown = useMarkdown;
     exports.useMicroTask = useMicroTask;
     exports.usePaginatedServerTask = usePaginatedServerTask;
     exports.usePub = usePub;
     exports.useRef = useRef;
     exports.useServerReducer = useServerReducer;
     exports.useServerTask = useServerTask;
+    exports.useSignalR = useSignalR;
     exports.useState = useState;
     exports.useSub = useSub;
 

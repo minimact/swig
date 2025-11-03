@@ -79,7 +79,7 @@ export { registerClientComputed, computeVariable, computeAllForComponent, comput
 export { TemplateStateManager, templateState } from './template-state';
 export type { Template, TemplateMap } from './template-state';
 export { TemplateRenderer } from './template-renderer';
-export { useState, useEffect, useRef, useServerTask, useServerReducer, setComponentContext, clearComponentContext, ComponentContext } from './hooks';
+export { useState, useEffect, useRef, useServerTask, useServerReducer, useMarkdown, setComponentContext, clearComponentContext, ComponentContext } from './hooks';
 export { useComputed } from './useComputed';
 export type { UseComputedOptions } from './useComputed';
 export { createContext, useContext, setContextHookContext, clearContextHookContext } from './useContext';
@@ -91,5 +91,7 @@ export type { PaginatedServerTask, PaginatedServerTaskOptions, PaginationParams 
 export { usePub, useSub } from './pub-sub';
 export type { PubSubMessage } from './pub-sub';
 export { useMicroTask, useMacroTask, useAnimationFrame, useIdleCallback } from './task-scheduling';
+export { useSignalR } from './signalr-hook-m';
+export type { SignalRHookState } from './signalr-hook-m';
 export * from './types';
 export default Minimact;
