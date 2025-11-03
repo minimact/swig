@@ -19064,27 +19064,57 @@ class ProcessController {
    */
   async build(projectPath) {
     const startTime = Date.now();
+    let fullOutput = "";
     try {
-      const result = await execa.execa("dotnet", ["build"], {
+      this.notifyOutputListeners("\x1B[1;36m● Building project...\x1B[0m\n");
+      const buildProcess = execa.execa("dotnet", ["build"], {
         cwd: projectPath,
-        all: true
+        all: true,
+        buffer: false
       });
+      if (buildProcess.stdout) {
+        buildProcess.stdout.on("data", (data) => {
+          const text = data.toString();
+          fullOutput += text;
+          this.notifyOutputListeners(text);
+        });
+      }
+      if (buildProcess.stderr) {
+        buildProcess.stderr.on("data", (data) => {
+          const text = data.toString();
+          fullOutput += text;
+          this.notifyOutputListeners(text);
+        });
+      }
+      const result = await buildProcess;
       const duration = Date.now() - startTime;
-      const output = result.all || "";
-      const errors = this.parseErrors(output);
-      const warnings = this.parseWarnings(output);
+      const errors = this.parseErrors(fullOutput);
+      const warnings = this.parseWarnings(fullOutput);
+      const success = result.exitCode === 0;
+      this.notifyOutputListeners(
+        success ? `\x1B[1;32m✓ Build succeeded in ${duration}ms\x1B[0m
+
+` : `\x1B[1;31m✗ Build failed in ${duration}ms\x1B[0m
+
+`
+      );
       return {
-        success: result.exitCode === 0,
-        output,
+        success,
+        output: fullOutput,
         errors,
         warnings,
         duration
       };
     } catch (error) {
       const duration = Date.now() - startTime;
+      const errorOutput = error.all || error.message || "";
+      fullOutput += errorOutput;
+      this.notifyOutputListeners(`\x1B[1;31m✗ Build failed: ${error.message}\x1B[0m
+
+`);
       return {
         success: false,
-        output: error.all || error.message || "",
+        output: fullOutput,
         errors: [error.message || "Build failed"],
         warnings: [],
         duration
@@ -19098,6 +19128,8 @@ class ProcessController {
     if (this.currentProcess) {
       throw new Error("A process is already running. Stop it first.");
     }
+    this.notifyOutputListeners(`\x1B[1;36m● Starting app on port ${port}...\x1B[0m
+`);
     this.currentProcess = execa.execa("dotnet", ["run", "--urls", `http://localhost:${port}`], {
       cwd: projectPath,
       all: true,
@@ -19116,9 +19148,12 @@ class ProcessController {
       });
     }
     this.currentProcess.on("exit", (code) => {
-      this.notifyOutputListeners(`
-Process exited with code ${code}
-`);
+      const exitMessage = code === 0 ? `\x1B[1;32m✓ Process exited cleanly (code ${code})\x1B[0m
+
+` : `\x1B[1;31m✗ Process exited with code ${code}\x1B[0m
+
+`;
+      this.notifyOutputListeners(exitMessage);
       this.currentProcess = null;
     });
   }
@@ -19191,16 +19226,79 @@ class SignalRClient {
    * Connect to SignalR hub
    */
   async connect(url) {
+    console.log(`[SignalRClient] Attempting to connect to: ${url}`);
     if (this.connection) {
       await this.disconnect();
     }
-    this.connection = new signalR__namespace.HubConnectionBuilder().withUrl(url).withAutomaticReconnect().build();
+    const electronFetch = async (input, init) => {
+      const urlStr = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      return new Promise((resolve, reject) => {
+        const request = electron.net.request({
+          url: urlStr,
+          method: init?.method || "GET"
+        });
+        if (init?.headers) {
+          const headers = init.headers;
+          Object.entries(headers).forEach(([key, value]) => {
+            request.setHeader(key, value);
+          });
+        }
+        request.on("response", (response) => {
+          const chunks = [];
+          response.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+          response.on("end", () => {
+            const body = Buffer.concat(chunks).toString();
+            resolve(new Response(body, {
+              status: response.statusCode,
+              headers: response.headers
+            }));
+          });
+        });
+        request.on("error", reject);
+        if (init?.body) {
+          request.write(init.body);
+        }
+        request.end();
+      });
+    };
+    this.connection = new signalR__namespace.HubConnectionBuilder().withUrl(url, {
+      transport: signalR__namespace.HttpTransportType.WebSockets,
+      // @ts-ignore - Use Electron's net module for HTTP requests
+      httpClient: {
+        async send(request) {
+          console.log(`[HttpClient] ${request.method} ${request.url}`);
+          console.log(`[HttpClient] Headers:`, request.headers);
+          const response = await electronFetch(request.url, {
+            method: request.method,
+            headers: request.headers,
+            body: request.content
+          });
+          const text = await response.text();
+          console.log(`[HttpClient] Response: ${response.status} ${response.statusText}`);
+          console.log(`[HttpClient] Body:`, text.substring(0, 200));
+          return {
+            statusCode: response.status,
+            statusText: response.statusText,
+            content: text
+          };
+        },
+        getCookieString(url2) {
+          return "";
+        }
+      }
+    }).withAutomaticReconnect().configureLogging(signalR__namespace.LogLevel.Debug).build();
     for (const [event, handlers] of this.eventHandlers.entries()) {
       for (const handler of handlers) {
         this.connection.on(event, handler);
       }
     }
-    await this.connection.start();
+    try {
+      await this.connection.start();
+      console.log(`[SignalRClient] Successfully connected to: ${url}`);
+    } catch (error) {
+      console.error(`[SignalRClient] Failed to connect to: ${url}`, error);
+      throw error;
+    }
   }
   /**
    * Disconnect from SignalR hub
