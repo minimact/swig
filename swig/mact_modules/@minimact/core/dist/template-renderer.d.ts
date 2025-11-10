@@ -167,7 +167,7 @@ export declare class TemplateRenderer {
      * Convert rendered loop VNodes to concrete patches
      * Generates Create/Replace patches for list update
      *
-     * @param parentPath - Path to parent element containing the list
+     * @param parentPath - Hex path to parent element containing the list
      * @param vnodes - Rendered VNodes for list items
      * @returns Array of patches to update the list
      */

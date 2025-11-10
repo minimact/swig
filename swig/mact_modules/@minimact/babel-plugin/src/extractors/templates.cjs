@@ -11,6 +11,7 @@
  */
 
 const t = require('@babel/types');
+const { getPathFromNode, getPathSegmentsFromNode } = require('../utils/pathAssignment.cjs');
 
 /**
  * Shared helper: Extract identifiers from expression (module-level for reuse)
@@ -295,70 +296,145 @@ function extractTemplates(renderBody, component) {
   /**
    * Traverse JSX tree and extract text templates
    */
-  function traverseJSX(node, parentPath = []) {
+  function traverseJSX(node, parentPath = [], siblingCounts = {}) {
     if (t.isJSXElement(node)) {
       const tagName = node.openingElement.name.name;
-      const elementIndex = pathStack.filter(p => p.tag === tagName).length;
-      const currentPath = [...parentPath, elementIndex];
-      const pathKey = buildPathKey(tagName, elementIndex, parentPath);
 
-      pathStack.push({ tag: tagName, index: elementIndex });
+      // 🔥 USE PRE-ASSIGNED HEX PATH (no recalculation!)
+      const pathKey = node.__minimactPath || null;
+      if (!pathKey) {
+        throw new Error(`[Template Extractor] No __minimactPath found on <${tagName}>. Did assignPathsToJSX run first?`);
+      }
+
+      // For backward compatibility with attribute extraction that expects array paths
+      const currentPath = getPathSegmentsFromNode(node);
+
+      pathStack.push({ tag: tagName, path: pathKey });
 
       // Process children
       let textNodeIndex = 0;
+
+      // First pass: Identify text/expression children and check for mixed content
+      const textChildren = [];
+      let hasTextNodes = false;
+      let hasExpressionNodes = false;
+
       for (const child of node.children) {
         if (t.isJSXText(child)) {
           const text = child.value.trim();
           if (text) {
-            // Static text - create template without bindings
-            const textPath = `${pathKey}.text[${textNodeIndex}]`;
-            templates[textPath] = {
-              template: text,
-              bindings: [],
-              slots: [],
-              path: [...currentPath, textNodeIndex],
-              type: 'static'
-            };
-            textNodeIndex++;
+            textChildren.push(child);
+            hasTextNodes = true;
           }
         } else if (t.isJSXExpressionContainer(child)) {
-          // Expression in text position: <h1>{count}</h1>
-          // Only create text template if this is actual text content, not structural JSX
           const expr = child.expression;
 
-          // Skip structural JSX (elements, fragments, conditionals with JSX, comments, .map() calls)
+          // Skip structural JSX
           const isStructural = t.isJSXElement(expr) ||
                                t.isJSXFragment(expr) ||
-                               t.isJSXEmptyExpression(expr) || // Comments: {/* ... */}
+                               t.isJSXEmptyExpression(expr) ||
                                (t.isLogicalExpression(expr) &&
                                 (t.isJSXElement(expr.right) || t.isJSXFragment(expr.right))) ||
                                (t.isConditionalExpression(expr) &&
                                 (t.isJSXElement(expr.consequent) || t.isJSXElement(expr.alternate) ||
                                  t.isJSXFragment(expr.consequent) || t.isJSXFragment(expr.alternate))) ||
-                               // Skip .map() calls - they return arrays of JSX elements
-                               // Also handles chained calls like .filter().map(), .slice().map()
                                isMapCallExpression(expr);
 
           if (!isStructural) {
-            // This is a text expression, extract template
-            const template = extractTextTemplate(node.children, currentPath, textNodeIndex);
-            if (template) {
-              const textPath = `${pathKey}.text[${textNodeIndex}]`;
-              templates[textPath] = template;
-              textNodeIndex++;
+            textChildren.push(child);
+            hasExpressionNodes = true;
+          }
+        }
+      }
+
+      // Second pass: Process text content
+      if (textChildren.length > 0) {
+        // Check if this is mixed content (text + expressions together)
+        const isMixedContent = hasTextNodes && hasExpressionNodes;
+
+        if (isMixedContent) {
+          // Mixed content: process all children together as one template
+          // Use the first child's hex path as the template path
+          const firstTextChild = textChildren[0];
+          const textPath = firstTextChild.__minimactPath || `${pathKey}.text[${textNodeIndex}]`;
+
+          const template = extractTextTemplate(node.children, currentPath, textNodeIndex);
+          if (template) {
+            console.log(`[Template Extractor] Found mixed content in <${tagName}>: "${template.template.substring(0, 50)}" (path: ${textPath})`);
+            templates[textPath] = template;
+            textNodeIndex++;
+          }
+        } else {
+          // Pure text or pure expressions: process each separately
+          for (const child of textChildren) {
+            if (t.isJSXText(child)) {
+              const text = child.value.trim();
+              if (text) {
+                // 🔥 USE PRE-ASSIGNED HEX PATH for text nodes
+                const textPath = child.__minimactPath || `${pathKey}.text[${textNodeIndex}]`;
+                console.log(`[Template Extractor] Found static text in <${tagName}>: "${text}" (path: ${textPath})`);
+                templates[textPath] = {
+                  template: text,
+                  bindings: [],
+                  slots: [],
+                  path: getPathSegmentsFromNode(child),
+                  type: 'static'
+                };
+                textNodeIndex++;
+              }
+            } else if (t.isJSXExpressionContainer(child)) {
+              // Pure expression: extract template for this child only
+              // 🔥 USE PRE-ASSIGNED HEX PATH for expression containers
+              const exprPath = child.__minimactPath || `${pathKey}.text[${textNodeIndex}]`;
+
+              const template = extractTextTemplate([child], currentPath, textNodeIndex);
+              if (template) {
+                console.log(`[Template Extractor] Found dynamic expression in <${tagName}>: "${template.template}" (path: ${exprPath})`);
+                templates[exprPath] = template;
+                textNodeIndex++;
+              }
             }
           }
-        } else if (t.isJSXElement(child)) {
-          traverseJSX(child, currentPath);
+        }
+      }
+
+      // Third pass: Traverse JSXElement children
+      const childSiblingCounts = {}; // Fresh sibling counts for children
+      for (const child of node.children) {
+        if (t.isJSXElement(child)) {
+          traverseJSX(child, currentPath, childSiblingCounts);
+        } else if (t.isJSXExpressionContainer(child)) {
+          const expr = child.expression;
+
+          // Traverse conditional JSX branches to extract templates from their content
+          // This handles: {condition && <div>...</div>} and {condition ? <A/> : <B/>}
+          if (t.isLogicalExpression(expr) && expr.operator === '&&') {
+            // Logical AND: {isAdmin && <div>Admin Panel</div>}
+            if (t.isJSXElement(expr.right)) {
+              console.log(`[Template Extractor] Traversing conditional branch (&&) in <${tagName}>`);
+              traverseJSX(expr.right, currentPath, childSiblingCounts);
+            }
+          } else if (t.isConditionalExpression(expr)) {
+            // Ternary: {isAdmin ? <AdminPanel/> : <UserPanel/>}
+            if (t.isJSXElement(expr.consequent)) {
+              console.log(`[Template Extractor] Traversing conditional branch (? consequent) in <${tagName}>`);
+              traverseJSX(expr.consequent, currentPath, childSiblingCounts);
+            }
+            if (t.isJSXElement(expr.alternate)) {
+              console.log(`[Template Extractor] Traversing conditional branch (? alternate) in <${tagName}>`);
+              traverseJSX(expr.alternate, currentPath, childSiblingCounts);
+            }
+          }
         }
       }
 
       pathStack.pop();
     } else if (t.isJSXFragment(node)) {
       // Handle fragments
+      const childSiblingCounts = {}; // Fresh sibling counts for fragment children
       for (const child of node.children) {
         if (t.isJSXElement(child)) {
-          traverseJSX(child, parentPath);
+          traverseJSX(child, parentPath, childSiblingCounts);
         }
       }
     }
@@ -483,7 +559,7 @@ function extractTemplates(renderBody, component) {
       template: templateStr,
       bindings,
       slots,
-      path: [...currentPath, textIndex],
+      path: currentPath,  // Already has full hex path from getPathSegmentsFromNode
       type: templateType
     };
 
@@ -754,43 +830,184 @@ function extractTemplates(renderBody, component) {
 
 /**
  * Extract templates for attributes (props)
- * Example: <div className={`count-${count}`} />
+ * Supports:
+ * - Template literals: className={`count-${count}`}
+ * - Style objects: style={{ fontSize: '32px', color: isActive ? 'red' : 'blue' }}
+ * - Static string attributes: className="btn-primary"
  */
 function extractAttributeTemplates(renderBody, component) {
   const templates = {};
 
-  function traverseJSX(node, parentPath = []) {
+  // Traverse JSX tree using pre-assigned hex paths
+  function traverseJSX(node) {
     if (t.isJSXElement(node)) {
       const tagName = node.openingElement.name.name;
-      const currentPath = [...parentPath, 0]; // Simplified
+
+      // 🔥 USE PRE-ASSIGNED HEX PATH (no recalculation!)
+      const elementPath = node.__minimactPath;
+      if (!elementPath) {
+        throw new Error(`[Attribute Extractor] No __minimactPath found on <${tagName}>. Did assignPathsToJSX run first?`);
+      }
+
+      const currentPath = getPathSegmentsFromNode(node);
 
       // Check attributes for template expressions
       for (const attr of node.openingElement.attributes) {
-        if (t.isJSXAttribute(attr) && t.isJSXExpressionContainer(attr.value)) {
-          const expr = attr.value.expression;
+        if (t.isJSXAttribute(attr)) {
+          const attrName = attr.name.name;
+          const attrValue = attr.value;
 
-          // Template literal: className={`count-${count}`}
-          if (t.isTemplateLiteral(expr)) {
-            const template = extractTemplateLiteralShared(expr, component);
+          // 🔥 USE PRE-ASSIGNED ATTRIBUTE PATH
+          const attrPath = attr.__minimactPath || `${elementPath}.@${attrName}`;
+
+          // 1. Template literal: className={`count-${count}`}
+          if (t.isJSXExpressionContainer(attrValue) && t.isTemplateLiteral(attrValue.expression)) {
+            const template = extractTemplateLiteralShared(attrValue.expression, component);
             if (template) {
-              const attrPath = `${tagName}[${currentPath.join(',')}].@${attr.name.name}`;
+              console.log(`[Attribute Template] Found template literal in ${attrName}: "${template.template}" (path: ${attrPath})`);
               templates[attrPath] = {
                 ...template,
                 path: currentPath,
-                attribute: attr.name.name
+                attribute: attrName,
+                type: template.bindings.length > 0 ? 'attribute-dynamic' : 'attribute-static'
+              };
+            }
+          }
+          // 2. Style object: style={{ fontSize: '32px', opacity: isVisible ? 1 : 0.5 }}
+          else if (attrName === 'style' && t.isJSXExpressionContainer(attrValue) && t.isObjectExpression(attrValue.expression)) {
+            const styleTemplate = extractStyleObjectTemplate(attrValue.expression, tagName, null, null, currentPath, component);
+            if (styleTemplate) {
+              console.log(`[Attribute Template] Found style object: "${styleTemplate.template.substring(0, 60)}..." (path: ${attrPath})`);
+              templates[attrPath] = styleTemplate;
+            }
+          }
+          // 3. Static string attribute: className="btn-primary", placeholder="Enter name"
+          else if (t.isStringLiteral(attrValue)) {
+            console.log(`[Attribute Template] Found static attribute ${attrName}: "${attrValue.value}" (path: ${attrPath})`);
+            templates[attrPath] = {
+              template: attrValue.value,
+              bindings: [],
+              slots: [],
+              path: currentPath,
+              attribute: attrName,
+              type: 'attribute-static'
+            };
+          }
+          // 4. Simple expression (for future dynamic attribute support)
+          else if (t.isJSXExpressionContainer(attrValue)) {
+            const expr = attrValue.expression;
+            // Check if it's a simple binding (identifier or member expression)
+            if (t.isIdentifier(expr) || t.isMemberExpression(expr)) {
+              const binding = t.isIdentifier(expr) ? expr.name : buildMemberPathShared(expr);
+              console.log(`[Attribute Template] Found dynamic attribute ${attrName}: binding="${binding}" (path: ${attrPath})`);
+              templates[attrPath] = {
+                template: '{0}',
+                bindings: [binding],
+                slots: [0],
+                path: currentPath,
+                attribute: attrName,
+                type: 'attribute-dynamic'
               };
             }
           }
         }
       }
 
-      // Traverse children
+      // Traverse children (no need to track indices - paths are pre-assigned!)
       for (const child of node.children) {
         if (t.isJSXElement(child)) {
-          traverseJSX(child, currentPath);
+          traverseJSX(child);
         }
       }
     }
+  }
+
+  /**
+   * Build attribute path key
+   * Example: div[0].@style or div[1].@className
+   */
+  function buildAttributePathKey(tagName, index, parentPath, attrName) {
+    const parentKeys = [];
+    for (let i = 0; i < parentPath.length; i++) {
+      parentKeys.push(`[${parentPath[i]}]`);
+    }
+    return `${parentKeys.join('.')}.${tagName}[${index}].@${attrName}`.replace(/^\./, '');
+  }
+
+  /**
+   * Extract template from style object
+   * Handles: { fontSize: '32px', opacity: isVisible ? 1 : 0.5 }
+   */
+  function extractStyleObjectTemplate(objectExpr, tagName, elementIndex, parentPath, currentPath, component) {
+    const { convertStyleObjectToCss } = require('../utils/styleConverter.cjs');
+
+    let hasBindings = false;
+    const cssProperties = [];
+    const bindings = [];
+    const slots = [];
+    let slotIndex = 0;
+
+    // Check each property for dynamic values
+    for (const prop of objectExpr.properties) {
+      if (t.isObjectProperty(prop) && !prop.computed) {
+        const key = t.isIdentifier(prop.key) ? prop.key.name : String(prop.key.value);
+        const cssKey = camelToKebabShared(key);
+        const value = prop.value;
+
+        // Check if value is dynamic (expression, conditional, etc.)
+        if (t.isConditionalExpression(value) || t.isIdentifier(value) || t.isMemberExpression(value)) {
+          // Dynamic value - extract binding
+          hasBindings = true;
+          const binding = extractBindingShared(value, component);
+          if (binding) {
+            bindings.push(typeof binding === 'object' ? binding.binding || binding.conditional : binding);
+            cssProperties.push(`${cssKey}: {${slotIndex}}`);
+            slots.push(cssProperties.join('; ').lastIndexOf('{'));
+            slotIndex++;
+          } else {
+            // Complex expression - fall back to static
+            const cssValue = convertStyleValueShared(value);
+            cssProperties.push(`${cssKey}: ${cssValue}`);
+          }
+        } else {
+          // Static value
+          const cssValue = convertStyleValueShared(value);
+          cssProperties.push(`${cssKey}: ${cssValue}`);
+        }
+      }
+    }
+
+    const cssString = cssProperties.join('; ');
+
+    return {
+      template: cssString,
+      bindings: bindings,
+      slots: slots,
+      path: currentPath,
+      attribute: 'style',
+      type: hasBindings ? 'attribute-dynamic' : 'attribute-static'
+    };
+  }
+
+  /**
+   * Convert camelCase to kebab-case (shared helper)
+   */
+  function camelToKebabShared(str) {
+    return str.replace(/[A-Z]/g, letter => `-${letter.toLowerCase()}`);
+  }
+
+  /**
+   * Convert style value to CSS string (shared helper)
+   */
+  function convertStyleValueShared(value) {
+    if (t.isStringLiteral(value)) {
+      return value.value;
+    } else if (t.isNumericLiteral(value)) {
+      return `${value.value}px`;
+    } else if (t.isIdentifier(value)) {
+      return value.name;
+    }
+    return String(value);
   }
 
   if (renderBody) {

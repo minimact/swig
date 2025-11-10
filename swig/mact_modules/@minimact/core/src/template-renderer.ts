@@ -161,6 +161,25 @@ export class TemplateRenderer {
         return this.convertLoopToPatches(patch.path, vnodes);
       }
 
+      case 'UpdateAttributeStatic': {
+        // Static attributes don't need materialization - just convert to UpdateProps
+        return {
+          type: 'UpdateProps',
+          path: patch.path,
+          props: { [patch.attrName]: patch.value }
+        };
+      }
+
+      case 'UpdateAttributeDynamic': {
+        // Materialize dynamic attribute template with current state
+        const value = this.renderTemplatePatch(patch.templatePatch, stateValues);
+        return {
+          type: 'UpdateProps',
+          path: patch.path,
+          props: { [patch.attrName]: value }
+        };
+      }
+
       default:
         // Not a template patch, return as-is
         return patch;
@@ -303,7 +322,11 @@ export class TemplateRenderer {
    * @returns True if patch is a template patch
    */
   static isTemplatePatch(patch: Patch): boolean {
-    return patch.type === 'UpdateTextTemplate' || patch.type === 'UpdatePropsTemplate';
+    return patch.type === 'UpdateTextTemplate'
+      || patch.type === 'UpdatePropsTemplate'
+      || patch.type === 'UpdateListTemplate'
+      || patch.type === 'UpdateAttributeStatic'
+      || patch.type === 'UpdateAttributeDynamic';
   }
 
   /**
@@ -313,7 +336,7 @@ export class TemplateRenderer {
    * @returns Array of state variable names, or empty array if not a template patch
    */
   static extractBindings(patch: Patch): string[] {
-    if (patch.type === 'UpdateTextTemplate' || patch.type === 'UpdatePropsTemplate') {
+    if (patch.type === 'UpdateTextTemplate' || patch.type === 'UpdatePropsTemplate' || patch.type === 'UpdateAttributeDynamic') {
       // Handle both string bindings and Binding objects
       return patch.templatePatch.bindings.map(binding => {
         if (typeof binding === 'object' && 'stateKey' in binding) {
@@ -321,6 +344,10 @@ export class TemplateRenderer {
         }
         return binding as string;
       });
+    }
+    if (patch.type === 'UpdateAttributeStatic') {
+      // Static attributes have no bindings
+      return [];
     }
     return [];
   }
@@ -507,21 +534,27 @@ export class TemplateRenderer {
    * Convert rendered loop VNodes to concrete patches
    * Generates Create/Replace patches for list update
    *
-   * @param parentPath - Path to parent element containing the list
+   * @param parentPath - Hex path to parent element containing the list
    * @param vnodes - Rendered VNodes for list items
    * @returns Array of patches to update the list
    */
   private static convertLoopToPatches(
-    parentPath: number[],
+    parentPath: string,
     vnodes: VNode[]
   ): Patch[] {
     // For Phase 4A simplicity: Replace entire list with Create patches
     // TODO Phase 4C: Optimize with incremental diffing
 
-    return vnodes.map((node, index) => ({
-      type: 'Create',
-      path: [...parentPath, index],
-      node
-    } as Patch));
+    return vnodes.map((node, index) => {
+      // Convert index to hex and append to parent path
+      const hexIndex = index.toString(16).padStart(8, '0');
+      const childPath = parentPath ? `${parentPath}.${hexIndex}` : hexIndex;
+
+      return {
+        type: 'Create',
+        path: childPath,
+        node
+      } as Patch;
+    });
   }
 }

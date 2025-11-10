@@ -21,8 +21,8 @@ export interface Template {
   bindings: string[];
   /** Character positions where params are inserted */
   slots: number[];
-  /** DOM path to the text node */
-  path: number[];
+  /** DOM hex path to the text node (e.g., "10000000.20000000") */
+  path: string;
   /** Template type: static | dynamic | attribute */
   type: 'static' | 'dynamic' | 'attribute';
   /** Attribute name (only for attribute templates) */
@@ -39,7 +39,7 @@ export interface TemplateMap {
 export interface TemplatePatch {
   type: 'UpdateTextTemplate' | 'UpdatePropTemplate';
   componentId: string;
-  path: number[];
+  path: number[]; // DOM index path [0, 2, 1]
   template: string;
   params: any[];
   bindings: string[];
@@ -48,7 +48,8 @@ export interface TemplatePatch {
 }
 
 /**
- * Template State Manager
+ * Template State Manager - Simplified for template rendering only
+ * Server now handles all path navigation via DOM indices
  */
 export class TemplateStateManager {
   private templates: Map<string, Template> = new Map();
@@ -62,7 +63,17 @@ export class TemplateStateManager {
 
     for (const [nodePath, template] of Object.entries(templateMap.templates)) {
       const key = `${componentId}:${nodePath}`;
-      this.templates.set(key, template);
+
+      // Normalize: Server sends 'templateString', client expects 'template'
+      const normalized: Template = {
+        template: (template as any).templateString || (template as any).template,
+        bindings: template.bindings,
+        slots: template.slots,
+        path: template.path,
+        type: template.type
+      };
+
+      this.templates.set(key, normalized);
     }
 
     // Initialize component state tracking
@@ -178,10 +189,18 @@ export class TemplateStateManager {
   applyTemplatePatch(patch: TemplatePatch): { text: string; path: number[] } | null {
     const { componentId, path, template, params, bindings, slots, attribute } = patch;
 
-    // Render template with params
-    const text = this.renderWithParams(template, params);
+    // Get current state values from client (not stale params from server!)
+    const currentParams: any[] = [];
+    for (const binding of bindings) {
+      const value = this.getStateValue(componentId, binding);
+      currentParams.push(value !== undefined ? value : params[currentParams.length]);
+    }
 
-    // Build node path key
+    // Render template with current client state
+    const text = this.renderWithParams(template, currentParams);
+
+    // Build node path key from DOM index path array
+    // Example: [0, 2, 1] → "0_2_1"
     const nodePath = this.buildNodePathKey(path);
     const key = `${componentId}:${nodePath}`;
 
@@ -200,7 +219,7 @@ export class TemplateStateManager {
         template,
         bindings,
         slots,
-        path,
+        path: path.join('.'), // Store as string for compatibility
         type: attribute ? 'attribute' : 'dynamic',
         attribute
       });
@@ -212,8 +231,8 @@ export class TemplateStateManager {
   }
 
   /**
-   * Build node path key from path array
-   * Example: [0, 1, 0] → "0_1_0"
+   * Build node path key from DOM index path array
+   * Example: [0, 2, 1] → "0_2_1"
    */
   private buildNodePathKey(path: number[]): string {
     return path.join('_');
@@ -256,10 +275,10 @@ export class TemplateStateManager {
     // Estimate memory usage (rough estimate)
     let memoryBytes = 0;
     for (const template of this.templates.values()) {
-      memoryBytes += template.template.length * 2; // UTF-16
-      memoryBytes += template.bindings.length * 20; // Rough estimate
-      memoryBytes += template.slots.length * 4; // 4 bytes per number
-      memoryBytes += template.path.length * 4;
+      memoryBytes += (template.template?.length || 0) * 2; // UTF-16
+      memoryBytes += (template.bindings?.length || 0) * 20; // Rough estimate
+      memoryBytes += (template.slots?.length || 0) * 4; // 4 bytes per number
+      memoryBytes += (template.path?.length || 0) * 2; // UTF-16 for hex string
     }
 
     return {

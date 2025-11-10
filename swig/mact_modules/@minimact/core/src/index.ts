@@ -6,8 +6,10 @@ import { HydrationManager } from './hydration';
 import { HintQueue } from './hint-queue';
 import { PlaygroundBridge } from './playground-bridge';
 import { HotReloadManager } from './hot-reload';
+import { MinimactComponentRegistry } from './component-registry';
 import * as ClientComputed from './client-computed';
 import { MinimactOptions, Patch } from './types';
+import { templateState } from './template-state';
 
 /**
  * Main Minimact client runtime
@@ -17,11 +19,13 @@ import { MinimactOptions, Patch } from './types';
  */
 export class Minimact {
   private signalR: SignalMManager;
-  private domPatcher: DOMPatcher;
+  public domPatcher: DOMPatcher; // Public for HotReloadManager access
   private clientState: ClientStateManager;
   private hydration: HydrationManager;
   private hintQueue: HintQueue;
   private playgroundBridge: PlaygroundBridge;
+  public componentRegistry: MinimactComponentRegistry; // Public for HotReloadManager access
+  private hotReload: HotReloadManager | null = null;
   private eventDelegation: EventDelegation | null = null;
   private options: Required<MinimactOptions>;
   private rootElement: HTMLElement;
@@ -42,7 +46,9 @@ export class Minimact {
     this.options = {
       hubUrl: options.hubUrl || '/minimact',
       enableDebugLogging: options.enableDebugLogging || false,
-      reconnectInterval: options.reconnectInterval || 5000
+      reconnectInterval: options.reconnectInterval || 5000,
+      enableHotReload: options.enableHotReload !== false, // Default to true
+      hotReloadWsUrl: options.hotReloadWsUrl
     };
 
     // Initialize subsystems (using lightweight SignalM!)
@@ -71,10 +77,22 @@ export class Minimact {
       debugLogging: this.options.enableDebugLogging
     });
 
+    this.componentRegistry = new MinimactComponentRegistry();
+
+    // Initialize hot reload if enabled
+    if (this.options.enableHotReload) {
+      this.hotReload = new HotReloadManager(this, {
+        enabled: true,
+        wsUrl: this.options.hotReloadWsUrl,
+        debounceMs: 50,
+        showNotifications: true,
+        logLevel: this.options.enableDebugLogging ? 'debug' : 'info'
+      });
+    }
+
     // Enable debug logging for client-computed module
     ClientComputed.setDebugLogging(this.options.enableDebugLogging);
 
-    this.setupSignalRHandlers();
     this.log('Minimact initialized', { rootElement: this.rootElement, options: this.options });
   }
 
@@ -82,11 +100,19 @@ export class Minimact {
    * Start the Minimact runtime
    */
   async start(): Promise<void> {
+    // Setup SignalR handlers BEFORE starting connection
+    this.setupSignalRHandlers();
+
     // Connect to SignalR hub
     await this.signalR.start();
 
     // Hydrate all components
     this.hydration.hydrateAll();
+
+    // Register hydrated components in registry
+    console.log('[Minimact] 🔍 Registering hydrated components...');
+    this.registerHydratedComponents();
+    console.log('[Minimact] 📊 Registry stats:', this.componentRegistry.getStats());
 
     // Setup event delegation
     this.eventDelegation = new EventDelegation(
@@ -190,6 +216,50 @@ export class Minimact {
       }
     });
 
+    // Handle hot reload messages
+    this.signalR.on('HotReload:TemplateMap', (data) => {
+      console.log('[Minimact] 📨 HotReload:TemplateMap received:', data);
+      console.log('[Minimact] 🔍 HotReload manager exists?', !!this.hotReload);
+      if (this.hotReload) {
+        this.log('Received template map', { componentId: data.componentId });
+        // Forward to hot reload manager
+        (this.hotReload as any).handleMessage({
+          type: 'template-map',
+          ...data
+        });
+      } else {
+        console.warn('[Minimact] ⚠️ HotReload manager not initialized, cannot process template map');
+      }
+    });
+
+    this.signalR.on('HotReload:TemplatePatch', (data) => {
+      if (this.hotReload) {
+        this.log('Received template patch', { componentId: data.componentId });
+        // Forward to hot reload manager
+        (this.hotReload as any).handleMessage({
+          type: 'template-patch',
+          ...data
+        });
+      }
+    });
+
+    this.signalR.on('HotReload:FileChange', (data) => {
+      if (this.hotReload) {
+        this.log('Received file change', { componentId: data.componentId });
+        // Forward to hot reload manager
+        (this.hotReload as any).handleMessage({
+          type: 'file-change',
+          ...data
+        });
+      }
+    });
+
+    this.signalR.on('HotReload:Error', (data) => {
+      if (this.hotReload) {
+        console.error('[Minimact Hot Reload] Error:', data.error);
+      }
+    });
+
     // Handle errors
     this.signalR.on('error', ({ message }) => {
       console.error('[Minimact] Server error:', message);
@@ -227,6 +297,49 @@ export class Minimact {
    */
   getComponent(componentId: string): any {
     return this.hydration.getComponent(componentId);
+  }
+
+  /**
+   * Register all hydrated components in the registry
+   * Extracts component type from ViewModel metadata
+   */
+  private registerHydratedComponents(): void {
+    // Get ViewModel with component metadata
+    const viewModel = (window as any).__MINIMACT_VIEWMODEL__;
+    if (!viewModel || !viewModel._componentType || !viewModel._componentId) {
+      console.warn('[Minimact] ViewModel metadata missing _componentType or _componentId');
+      return;
+    }
+
+    const componentType = viewModel._componentType;
+    const instanceId = viewModel._componentId;
+
+    // Find the component element
+    const element = document.querySelector(`[data-minimact-component-id="${instanceId}"]`) as HTMLElement;
+    if (!element) {
+      console.warn(`[Minimact] Component element not found for ${instanceId}`);
+      return;
+    }
+
+    // Get component metadata from hydration
+    const component = this.hydration.getComponent(instanceId);
+    if (!component) {
+      console.warn(`[Minimact] Component not hydrated for ${instanceId}`);
+      return;
+    }
+
+    // Update component metadata with type
+    component.type = componentType;
+
+    // Register in registry
+    this.componentRegistry.register({
+      type: componentType,
+      instanceId: instanceId,
+      element: element,
+      context: component.context
+    });
+
+    console.log(`[Minimact] Registered ${componentType} (${instanceId.substring(0, 8)}...) in registry`);
   }
 
   /**
@@ -309,6 +422,8 @@ export { ClientStateManager } from './client-state';
 export { EventDelegation } from './event-delegation';
 export { HydrationManager } from './hydration';
 export { HintQueue } from './hint-queue';
+export { HotReloadManager } from './hot-reload';
+export type { HotReloadConfig, HotReloadMessage, HotReloadMetrics } from './hot-reload';
 
 // Client-computed state (for external libraries)
 export {
@@ -332,7 +447,10 @@ export type { Template, TemplateMap } from './template-state';
 export { TemplateRenderer } from './template-renderer';
 
 // Core hooks
-export { useState, useEffect, useRef, useServerTask, useServerReducer, useMarkdown, setComponentContext, clearComponentContext, ComponentContext } from './hooks';
+export { useState, useProtectedState, useEffect, useRef, useServerTask, useServerReducer, useMarkdown, setComponentContext, clearComponentContext, ComponentContext } from './hooks';
+
+// State proxy (compile-time only for TypeScript IntelliSense)
+export { state, setState, ComponentState, State } from './state-proxy';
 
 // useComputed hook (for client-side computation with browser APIs/libraries)
 export { useComputed } from './useComputed';
@@ -362,6 +480,10 @@ export { useMicroTask, useMacroTask, useAnimationFrame, useIdleCallback } from '
 // SignalR hook (lightweight SignalM implementation)
 export { useSignalR } from './signalr-hook-m';
 export type { SignalRHookState } from './signalr-hook-m';
+
+// Component Registry
+export { MinimactComponentRegistry } from './component-registry';
+export type { ComponentMetadata } from './component-registry';
 
 // Types
 export * from './types';

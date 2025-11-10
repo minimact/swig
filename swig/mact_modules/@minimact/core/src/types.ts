@@ -4,6 +4,7 @@
 
 export interface VNode {
   type: 'Element' | 'Text' | 'Fragment' | 'RawHtml';
+  path?: string;
 }
 
 export interface VElement extends VNode {
@@ -93,17 +94,20 @@ export type ItemTemplate =
     };
 
 export type Patch =
-  | { type: 'Create'; path: number[]; node: VNode }
-  | { type: 'Remove'; path: number[] }
-  | { type: 'Replace'; path: number[]; node: VNode }
-  | { type: 'UpdateText'; path: number[]; content: string }
-  | { type: 'UpdateProps'; path: number[]; props: Record<string, string> }
-  | { type: 'ReorderChildren'; path: number[]; order: string[] }
+  | { type: 'Create'; path: string | number[]; node: VNode }
+  | { type: 'Remove'; path: string | number[] }
+  | { type: 'Replace'; path: string | number[]; node: VNode }
+  | { type: 'UpdateText'; path: string | number[]; content: string }
+  | { type: 'UpdateProps'; path: string | number[]; props: Record<string, string> }
+  | { type: 'ReorderChildren'; path: string | number[]; order: string[] }
   // Template patches for runtime prediction (100% coverage with minimal memory)
-  | { type: 'UpdateTextTemplate'; path: number[]; templatePatch: TemplatePatch }
-  | { type: 'UpdatePropsTemplate'; path: number[]; propName: string; templatePatch: TemplatePatch }
+  | { type: 'UpdateTextTemplate'; path: string | number[]; templatePatch: TemplatePatch }
+  | { type: 'UpdatePropsTemplate'; path: string | number[]; propName: string; templatePatch: TemplatePatch }
   // Loop template patch for array rendering (.map patterns)
-  | { type: 'UpdateListTemplate'; path: number[]; loopTemplate: LoopTemplate };
+  | { type: 'UpdateListTemplate'; path: string | number[]; loopTemplate: LoopTemplate }
+  // Attribute template patches for static and dynamic attributes (className, style, etc.)
+  | { type: 'UpdateAttributeStatic'; path: string | number[]; attrName: string; value: string }
+  | { type: 'UpdateAttributeDynamic'; path: string | number[]; attrName: string; templatePatch: TemplatePatch };
 
 export interface ComponentState {
   [key: string]: any;
@@ -113,10 +117,13 @@ export interface MinimactOptions {
   hubUrl?: string;
   enableDebugLogging?: boolean;
   reconnectInterval?: number;
+  enableHotReload?: boolean;
+  hotReloadWsUrl?: string;
 }
 
 export interface ComponentMetadata {
   componentId: string;
+  type?: string;  // Component type (e.g., "ProductPage")
   connectionId?: string;
   element: HTMLElement;
   clientState: ComponentState;

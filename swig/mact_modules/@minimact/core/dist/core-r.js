@@ -3602,7 +3602,7 @@ var Minimact = (function (exports) {
 
     /**
      * Applies DOM patches from the server to the actual DOM
-     * Handles surgical updates for minimal DOM manipulation
+     * Server sends DOM index-based patches - client just does simple array indexing!
      */
     class DOMPatcher {
         constructor(options = {}) {
@@ -3654,29 +3654,45 @@ var Minimact = (function (exports) {
         }
         /**
          * Create and insert a new node
+         * The path is in node.path (converted DOM index path from server)
          */
         patchCreate(rootElement, path, node) {
             const newElement = this.createElementFromVNode(node);
-            if (path.length === 0) {
-                // Replace root
+            // Get path from node.path (it's a string like "0.1.1.2")
+            const nodePath = node.path;
+            if (!nodePath) {
+                console.error('[DOMPatcher] Node has no path for Create');
+                return;
+            }
+            // Convert string path to number array
+            const indices = nodePath.split('.').map(s => parseInt(s, 10));
+            if (indices.length === 0) {
+                console.error('[DOMPatcher] Invalid empty path for Create');
+                return;
+            }
+            // Handle root insertion
+            if (indices.length === 1 && indices[0] === 0) {
                 rootElement.innerHTML = '';
                 rootElement.appendChild(newElement);
+                this.log('Created root node', { node });
+                return;
+            }
+            // Navigate to parent using all but last index
+            const parentIndices = indices.slice(0, -1);
+            const insertionIndex = indices[indices.length - 1];
+            const parent = this.getElementByPath(rootElement, parentIndices);
+            if (!parent) {
+                console.error('[DOMPatcher] Parent not found for Create at path:', nodePath);
+                return;
+            }
+            // Insert at the specified index
+            if (insertionIndex >= parent.childNodes.length) {
+                parent.appendChild(newElement);
             }
             else {
-                // Insert at path
-                const parentPath = path.slice(0, -1);
-                const index = path[path.length - 1];
-                const parent = this.getElementByPath(rootElement, parentPath);
-                if (parent) {
-                    if (index >= parent.childNodes.length) {
-                        parent.appendChild(newElement);
-                    }
-                    else {
-                        parent.insertBefore(newElement, parent.childNodes[index]);
-                    }
-                }
+                parent.insertBefore(newElement, parent.childNodes[insertionIndex]);
             }
-            this.log('Created node', { path, node });
+            this.log('Created node', { path: nodePath, node });
         }
         /**
          * Remove a node from the DOM
@@ -3767,12 +3783,21 @@ var Minimact = (function (exports) {
             this.log('Reordered children', { element, order });
         }
         /**
-         * Get a DOM element by its path (array of indices)
+         * Get a DOM element by its DOM index path
+         * Simple array indexing through childNodes - server handles all null path complexity!
          */
         getElementByPath(rootElement, path) {
+            // Handle empty path
+            if (!path || (Array.isArray(path) && path.length === 0)) {
+                return rootElement;
+            }
+            // Path should be number array from server (DomPatch)
+            const indices = Array.isArray(path) ? path : [];
+            // Simple navigation through childNodes using indices
             let current = rootElement;
-            for (const index of path) {
+            for (const index of indices) {
                 if (index >= current.childNodes.length) {
+                    console.error(`[DOMPatcher] Index ${index} out of bounds (${current.childNodes.length} children)`);
                     return null;
                 }
                 current = current.childNodes[index];
@@ -4113,21 +4138,29 @@ var Minimact = (function (exports) {
             if (!handlerStr) {
                 return null;
             }
+            // Check for @client: prefix (client-only handler)
+            let isClientOnly = false;
+            let cleanHandlerStr = handlerStr;
+            if (handlerStr.startsWith('@client:')) {
+                isClientOnly = true;
+                cleanHandlerStr = handlerStr.substring(8); // Remove '@client:' prefix
+            }
             // Parse handler string
             // Format: "MethodName" or "MethodName:arg1:arg2"
-            const parts = handlerStr.split(':');
+            const parts = cleanHandlerStr.split(':');
             const methodName = parts[0];
             const args = parts.slice(1);
             // Find component ID
             const componentId = this.findComponentId(element);
-            if (!componentId) {
+            if (!componentId && !isClientOnly) {
                 console.warn('[Minimact] No component ID found for event handler:', handlerStr);
                 return null;
             }
             return {
-                componentId,
+                componentId: componentId || '',
                 methodName,
-                args
+                args,
+                isClientOnly
             };
         }
         /**
@@ -4152,6 +4185,21 @@ var Minimact = (function (exports) {
         async executeHandler(handler, event, element) {
             const startTime = performance.now();
             try {
+                // Handle client-only handlers (run locally, don't call server)
+                if (handler.isClientOnly) {
+                    const clientHandler = window.MinimactHandlers?.[handler.methodName];
+                    if (clientHandler && typeof clientHandler === 'function') {
+                        this.log(`🟦 CLIENT HANDLER: ${handler.methodName}`, { handler });
+                        clientHandler(event);
+                        const latency = performance.now() - startTime;
+                        this.log(`🟦 CLIENT HANDLER completed in ${latency.toFixed(2)}ms`, { handler });
+                        return;
+                    }
+                    else {
+                        console.warn(`[Minimact] Client handler '${handler.methodName}' not found in window.MinimactHandlers`);
+                        return;
+                    }
+                }
                 // Build args object
                 const argsObj = {};
                 // Add parsed args from handler string
@@ -4306,10 +4354,10 @@ var Minimact = (function (exports) {
         /**
          * Hydrate a component root element
          */
-        hydrateComponent(componentId, rootElement) {
-            this.log('Hydrating component', { componentId });
-            // The actual component element is the first child of the container
-            // (rootElement is #minimact-root, first child is the actual component div)
+        hydrateComponent(componentId, rootElement, componentType) {
+            this.log('Hydrating component', { componentId, componentType });
+            // rootElement is the container (e.g., #minimact-root) that holds the component tree
+            // The first child is the actual component root element (e.g., the "10000000" element)
             const componentElement = rootElement.firstElementChild;
             if (!componentElement) {
                 console.error('[Minimact Hydration] No component element found in root');
@@ -4318,7 +4366,8 @@ var Minimact = (function (exports) {
             // Create component metadata
             const metadata = {
                 componentId,
-                element: componentElement, // Use the actual component element, not the container
+                type: componentType,
+                element: rootElement, // Store the container so patches can navigate from the first child
                 clientState: {},
                 serverState: {}
             };
@@ -4627,6 +4676,23 @@ var Minimact = (function (exports) {
                     // Convert to concrete patches
                     return this.convertLoopToPatches(patch.path, vnodes);
                 }
+                case 'UpdateAttributeStatic': {
+                    // Static attributes don't need materialization - just convert to UpdateProps
+                    return {
+                        type: 'UpdateProps',
+                        path: patch.path,
+                        props: { [patch.attrName]: patch.value }
+                    };
+                }
+                case 'UpdateAttributeDynamic': {
+                    // Materialize dynamic attribute template with current state
+                    const value = this.renderTemplatePatch(patch.templatePatch, stateValues);
+                    return {
+                        type: 'UpdateProps',
+                        path: patch.path,
+                        props: { [patch.attrName]: value }
+                    };
+                }
                 default:
                     // Not a template patch, return as-is
                     return patch;
@@ -4745,7 +4811,11 @@ var Minimact = (function (exports) {
          * @returns True if patch is a template patch
          */
         static isTemplatePatch(patch) {
-            return patch.type === 'UpdateTextTemplate' || patch.type === 'UpdatePropsTemplate';
+            return patch.type === 'UpdateTextTemplate'
+                || patch.type === 'UpdatePropsTemplate'
+                || patch.type === 'UpdateListTemplate'
+                || patch.type === 'UpdateAttributeStatic'
+                || patch.type === 'UpdateAttributeDynamic';
         }
         /**
          * Extract bindings from a template patch
@@ -4754,7 +4824,7 @@ var Minimact = (function (exports) {
          * @returns Array of state variable names, or empty array if not a template patch
          */
         static extractBindings(patch) {
-            if (patch.type === 'UpdateTextTemplate' || patch.type === 'UpdatePropsTemplate') {
+            if (patch.type === 'UpdateTextTemplate' || patch.type === 'UpdatePropsTemplate' || patch.type === 'UpdateAttributeDynamic') {
                 // Handle both string bindings and Binding objects
                 return patch.templatePatch.bindings.map(binding => {
                     if (typeof binding === 'object' && 'stateKey' in binding) {
@@ -4762,6 +4832,10 @@ var Minimact = (function (exports) {
                     }
                     return binding;
                 });
+            }
+            if (patch.type === 'UpdateAttributeStatic') {
+                // Static attributes have no bindings
+                return [];
             }
             return [];
         }
@@ -4911,18 +4985,23 @@ var Minimact = (function (exports) {
          * Convert rendered loop VNodes to concrete patches
          * Generates Create/Replace patches for list update
          *
-         * @param parentPath - Path to parent element containing the list
+         * @param parentPath - Hex path to parent element containing the list
          * @param vnodes - Rendered VNodes for list items
          * @returns Array of patches to update the list
          */
         static convertLoopToPatches(parentPath, vnodes) {
             // For Phase 4A simplicity: Replace entire list with Create patches
             // TODO Phase 4C: Optimize with incremental diffing
-            return vnodes.map((node, index) => ({
-                type: 'Create',
-                path: [...parentPath, index],
-                node
-            }));
+            return vnodes.map((node, index) => {
+                // Convert index to hex and append to parent path
+                const hexIndex = index.toString(16).padStart(8, '0');
+                const childPath = parentPath ? `${parentPath}.${hexIndex}` : hexIndex;
+                return {
+                    type: 'Create',
+                    path: childPath,
+                    node
+                };
+            });
         }
     }
 
@@ -5353,7 +5432,8 @@ var Minimact = (function (exports) {
      * Latency: <5ms for template updates
      */
     /**
-     * Template State Manager
+     * Template State Manager - Simplified for template rendering only
+     * Server now handles all path navigation via DOM indices
      */
     class TemplateStateManager {
         constructor() {
@@ -5367,7 +5447,15 @@ var Minimact = (function (exports) {
             console.log(`[TemplateState] Loading ${Object.keys(templateMap.templates).length} templates for ${componentId}`);
             for (const [nodePath, template] of Object.entries(templateMap.templates)) {
                 const key = `${componentId}:${nodePath}`;
-                this.templates.set(key, template);
+                // Normalize: Server sends 'templateString', client expects 'template'
+                const normalized = {
+                    template: template.templateString || template.template,
+                    bindings: template.bindings,
+                    slots: template.slots,
+                    path: template.path,
+                    type: template.type
+                };
+                this.templates.set(key, normalized);
             }
             // Initialize component state tracking
             if (!this.componentStates.has(componentId)) {
@@ -5459,9 +5547,16 @@ var Minimact = (function (exports) {
          */
         applyTemplatePatch(patch) {
             const { componentId, path, template, params, bindings, slots, attribute } = patch;
-            // Render template with params
-            const text = this.renderWithParams(template, params);
-            // Build node path key
+            // Get current state values from client (not stale params from server!)
+            const currentParams = [];
+            for (const binding of bindings) {
+                const value = this.getStateValue(componentId, binding);
+                currentParams.push(value !== undefined ? value : params[currentParams.length]);
+            }
+            // Render template with current client state
+            const text = this.renderWithParams(template, currentParams);
+            // Build node path key from DOM index path array
+            // Example: [0, 2, 1] → "0_2_1"
             const nodePath = this.buildNodePathKey(path);
             const key = `${componentId}:${nodePath}`;
             // Update stored template
@@ -5480,7 +5575,7 @@ var Minimact = (function (exports) {
                     template,
                     bindings,
                     slots,
-                    path,
+                    path: path.join('.'), // Store as string for compatibility
                     type: attribute ? 'attribute' : 'dynamic',
                     attribute
                 });
@@ -5489,8 +5584,8 @@ var Minimact = (function (exports) {
             return { text, path };
         }
         /**
-         * Build node path key from path array
-         * Example: [0, 1, 0] → "0_1_0"
+         * Build node path key from DOM index path array
+         * Example: [0, 2, 1] → "0_2_1"
          */
         buildNodePathKey(path) {
             return path.join('_');
@@ -5526,10 +5621,10 @@ var Minimact = (function (exports) {
             // Estimate memory usage (rough estimate)
             let memoryBytes = 0;
             for (const template of this.templates.values()) {
-                memoryBytes += template.template.length * 2; // UTF-16
-                memoryBytes += template.bindings.length * 20; // Rough estimate
-                memoryBytes += template.slots.length * 4; // 4 bytes per number
-                memoryBytes += template.path.length * 4;
+                memoryBytes += (template.template?.length || 0) * 2; // UTF-16
+                memoryBytes += (template.bindings?.length || 0) * 20; // Rough estimate
+                memoryBytes += (template.slots?.length || 0) * 4; // 4 bytes per number
+                memoryBytes += (template.path?.length || 0) * 2; // UTF-16 for hex string
             }
             return {
                 componentCount,
@@ -5941,12 +6036,16 @@ var Minimact = (function (exports) {
         currentContext$1 = null;
     }
     /**
-     * Find DOM element by path array
-     * Example: [0, 1, 0] → first child, second child, first child
+     * Find DOM element by hex path string
+     * Example: "10000000.20000000.30000000" → convert to indices and navigate
      */
     function findElementByPath(root, path) {
+        if (path === '' || path === '.') {
+            return root;
+        }
         let current = root;
-        for (const index of path) {
+        const indices = path.split('.').map(hex => parseInt(hex, 16));
+        for (const index of indices) {
             if (!current || !current.childNodes)
                 return null;
             current = current.childNodes[index] || null;
@@ -6016,8 +6115,8 @@ var Minimact = (function (exports) {
             // Re-render templates bound to this state
             const boundTemplates = templateState.getTemplatesBoundTo(context.componentId, stateKey);
             for (const template of boundTemplates) {
-                // Build node path from template path array
-                const nodePath = template.path.join('_');
+                // Build node path key from hex path string
+                const nodePath = template.path.replace(/\./g, '_');
                 // Render template with new value
                 const newText = templateState.render(context.componentId, nodePath);
                 if (newText !== null) {

@@ -347,10 +347,17 @@ function generateComponent(component) {
       }
     }
 
-    // Generate [OnStateChanged] for each dependency
-    for (const dep of deps) {
-      lines.push(`    [OnStateChanged("${dep}")]`);
+    // Generate [OnStateChanged] for each dependency, or [OnMounted] if no dependencies
+    if (deps.length === 0 && effect.dependencies && t.isArrayExpression(effect.dependencies) && effect.dependencies.elements.length === 0) {
+      // Empty dependency array [] means run only on mount
+      lines.push(`    [OnMounted]`);
+    } else if (deps.length > 0) {
+      // Run when these dependencies change
+      for (const dep of deps) {
+        lines.push(`    [OnStateChanged("${dep}")]`);
+      }
     }
+    // If no dependency array provided (undefined), no attribute needed - runs on every render
 
     lines.push(`    private void Effect_${effectIndex}()`);
     lines.push('    {');
@@ -433,6 +440,31 @@ function generateComponent(component) {
     lines.push('    {');
     lines.push(`        ${toggle.name} = !${toggle.name};`);
     lines.push(`        SetState("${toggle.name}", ${toggle.name});`);
+    lines.push('    }');
+  }
+
+  // GetClientHandlers method - returns JavaScript code for client-only event handlers
+  if (component.clientHandlers && component.clientHandlers.length > 0) {
+    lines.push('');
+    lines.push('    protected override Dictionary<string, string> GetClientHandlers()');
+    lines.push('    {');
+    lines.push('        return new Dictionary<string, string>');
+    lines.push('        {');
+
+    for (let i = 0; i < component.clientHandlers.length; i++) {
+      const handler = component.clientHandlers[i];
+      // Escape the JavaScript code for C# string literal
+      const escapedJs = handler.jsCode
+        .replace(/\\/g, '\\\\')  // Escape backslashes
+        .replace(/"/g, '\\"')    // Escape quotes
+        .replace(/\n/g, '\\n')   // Escape newlines
+        .replace(/\r/g, '');     // Remove carriage returns
+
+      const comma = i < component.clientHandlers.length - 1 ? ',' : '';
+      lines.push(`            ["${handler.name}"] = @"${escapedJs}"${comma}`);
+    }
+
+    lines.push('        };');
     lines.push('    }');
   }
 

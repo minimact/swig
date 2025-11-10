@@ -20,8 +20,8 @@ export interface Template {
     bindings: string[];
     /** Character positions where params are inserted */
     slots: number[];
-    /** DOM path to the text node */
-    path: number[];
+    /** DOM hex path to the text node (e.g., "10000000.20000000") */
+    path: string;
     /** Template type: static | dynamic | attribute */
     type: 'static' | 'dynamic' | 'attribute';
     /** Attribute name (only for attribute templates) */
@@ -44,7 +44,8 @@ export interface TemplatePatch {
     attribute?: string;
 }
 /**
- * Template State Manager
+ * Template State Manager - Simplified for template rendering only
+ * Server now handles all path navigation via DOM indices
  */
 export declare class TemplateStateManager {
     private templates;
@@ -93,8 +94,8 @@ export declare class TemplateStateManager {
         path: number[];
     } | null;
     /**
-     * Build node path key from path array
-     * Example: [0, 1, 0] → "0_1_0"
+     * Build node path key from DOM index path array
+     * Example: [0, 2, 1] → "0_2_1"
      */
     private buildNodePathKey;
     /**

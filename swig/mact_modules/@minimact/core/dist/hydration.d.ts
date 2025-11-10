@@ -14,7 +14,7 @@ export declare class HydrationManager {
     /**
      * Hydrate a component root element
      */
-    hydrateComponent(componentId: string, rootElement: HTMLElement): void;
+    hydrateComponent(componentId: string, rootElement: HTMLElement, componentType?: string): void;
     /**
      * Hydrate client-only zones (data-minimact-client-scope)
      */

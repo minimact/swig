@@ -1,3 +1,5 @@
+import { DOMPatcher } from './dom-patcher';
+import { MinimactComponentRegistry } from './component-registry';
 import { MinimactOptions } from './types';
 /**
  * Main Minimact client runtime
@@ -7,11 +9,13 @@ import { MinimactOptions } from './types';
  */
 export declare class Minimact {
     private signalR;
-    private domPatcher;
+    domPatcher: DOMPatcher;
     private clientState;
     private hydration;
     private hintQueue;
     private playgroundBridge;
+    componentRegistry: MinimactComponentRegistry;
+    private hotReload;
     private eventDelegation;
     private options;
     private rootElement;
@@ -40,6 +44,11 @@ export declare class Minimact {
      * Get component by ID (for hot reload)
      */
     getComponent(componentId: string): any;
+    /**
+     * Register all hydrated components in the registry
+     * Extracts component type from ViewModel metadata
+     */
+    private registerHydratedComponents;
     /**
      * Get client state for a component
      */
@@ -75,11 +84,14 @@ export { ClientStateManager } from './client-state';
 export { EventDelegation } from './event-delegation';
 export { HydrationManager } from './hydration';
 export { HintQueue } from './hint-queue';
+export { HotReloadManager } from './hot-reload';
+export type { HotReloadConfig, HotReloadMessage, HotReloadMetrics } from './hot-reload';
 export { registerClientComputed, computeVariable, computeAllForComponent, computeDependentVariables, getLastValue, getAllLastValues, hasClientComputed, getComputedVariableNames, clearComponent as clearClientComputedComponent, getDebugInfo as getClientComputedDebugInfo } from './client-computed';
 export { TemplateStateManager, templateState } from './template-state';
 export type { Template, TemplateMap } from './template-state';
 export { TemplateRenderer } from './template-renderer';
-export { useState, useEffect, useRef, useServerTask, useServerReducer, useMarkdown, setComponentContext, clearComponentContext, ComponentContext } from './hooks';
+export { useState, useProtectedState, useEffect, useRef, useServerTask, useServerReducer, useMarkdown, setComponentContext, clearComponentContext, ComponentContext } from './hooks';
+export { state, setState, ComponentState, State } from './state-proxy';
 export { useComputed } from './useComputed';
 export type { UseComputedOptions } from './useComputed';
 export { createContext, useContext, setContextHookContext, clearContextHookContext } from './useContext';
@@ -93,5 +105,7 @@ export type { PubSubMessage } from './pub-sub';
 export { useMicroTask, useMacroTask, useAnimationFrame, useIdleCallback } from './task-scheduling';
 export { useSignalR } from './signalr-hook-m';
 export type { SignalRHookState } from './signalr-hook-m';
+export { MinimactComponentRegistry } from './component-registry';
+export type { ComponentMetadata } from './component-registry';
 export * from './types';
 export default Minimact;

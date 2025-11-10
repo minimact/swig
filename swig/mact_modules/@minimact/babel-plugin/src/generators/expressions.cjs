@@ -8,6 +8,7 @@ const { analyzeDependencies } = require('../analyzers/dependencies.cjs');
 const { classifyNode } = require('../analyzers/classification.cjs');
 const { generateRuntimeHelperForJSXNode } = require('./runtimeHelpers.cjs');
 const { generateJSXElement } = require('./jsx.cjs');
+const { getPathFromNode } = require('../utils/pathAssignment.cjs');
 
 // Module-level variable to store current component context
 // This allows useState setter detection without threading component through all calls
@@ -64,9 +65,18 @@ function generateJSXExpression(expr, component, indent) {
     const consequent = t.isJSXElement(expr.consequent) || t.isJSXFragment(expr.consequent)
       ? generateRuntimeHelperForJSXNode(expr.consequent, component, indent)
       : generateCSharpExpression(expr.consequent, false); // Normal C# expression context
-    const alternate = t.isJSXElement(expr.alternate) || t.isJSXFragment(expr.alternate)
-      ? generateRuntimeHelperForJSXNode(expr.alternate, component, indent)
-      : generateCSharpExpression(expr.alternate, false); // Normal C# expression context
+
+    // Handle alternate - if null literal, use VNull with path
+    let alternate;
+    if (!expr.alternate || t.isNullLiteral(expr.alternate)) {
+      const exprPath = expr.__minimactPath || '';
+      alternate = `new VNull("${exprPath}")`;
+    } else if (t.isJSXElement(expr.alternate) || t.isJSXFragment(expr.alternate)) {
+      alternate = generateRuntimeHelperForJSXNode(expr.alternate, component, indent);
+    } else {
+      alternate = generateCSharpExpression(expr.alternate, false); // Normal C# expression context
+    }
+
     return `(${condition}) ? ${consequent} : ${alternate}`;
   }
 
@@ -77,8 +87,9 @@ function generateJSXExpression(expr, component, indent) {
     const right = t.isJSXElement(expr.right) || t.isJSXFragment(expr.right)
       ? generateRuntimeHelperForJSXNode(expr.right, component, indent)
       : generateCSharpExpression(expr.right);
-    // Use != null for truthy check (works for bool, object, int, etc.)
-    return `(${left}) ? ${right} : null`;
+    // Get path for VNull (use the expression container's path)
+    const exprPath = expr.__minimactPath || '';
+    return `(${left}) ? ${right} : new VNull("${exprPath}")`;
   }
 
   if (t.isCallExpression(expr) &&
@@ -333,7 +344,10 @@ function generateCSharpStatement(node) {
  * @param {boolean} inInterpolation - True if this expression will be inside $"{...}"
  */
 function generateCSharpExpression(node, inInterpolation = false) {
-  if (!node) return 'null';
+  if (!node) {
+    const nodePath = node?.__minimactPath || '';
+    return `new VNull("${nodePath}")`;
+  }
 
   if (t.isStringLiteral(node)) {
     // In string interpolation context, escape the quotes: \"text\"
@@ -354,11 +368,27 @@ function generateCSharpExpression(node, inInterpolation = false) {
   }
 
   if (t.isNullLiteral(node)) {
-    return 'null';
+    const nodePath = node.__minimactPath || '';
+    return `new VNull("${nodePath}")`;
   }
 
   if (t.isIdentifier(node)) {
+    // Special case: 'state' identifier (state proxy)
+    // Note: This should only happen as part of member expression (state.key or state["key"])
+    // Standalone 'state' reference is unusual - warn but transpile to 'State'
+    if (node.name === 'state') {
+      console.warn('[Babel Plugin] Naked state reference detected (should be state.key or state["key"])');
+      return 'State';
+    }
+
     return node.name;
+  }
+
+  if (t.isAssignmentExpression(node)) {
+    const left = generateCSharpExpression(node.left, inInterpolation);
+    const right = generateCSharpExpression(node.right, inInterpolation);
+    const operator = node.operator; // =, +=, -=, etc.
+    return `${left} ${operator} ${right}`;
   }
 
   if (t.isAwaitExpression(node)) {
@@ -393,8 +423,29 @@ function generateCSharpExpression(node, inInterpolation = false) {
   }
 
   if (t.isMemberExpression(node)) {
+    // Special case: state.key or state["key"] (state proxy)
+    if (t.isIdentifier(node.object, { name: 'state' })) {
+      if (node.computed) {
+        // state["someKey"] or state["Child.key"] → State["someKey"] or State["Child.key"]
+        const key = generateCSharpExpression(node.property, inInterpolation);
+        return `State[${key}]`;
+      } else {
+        // state.someKey → State["someKey"]
+        const key = node.property.name;
+        return `State["${key}"]`;
+      }
+    }
+
     const object = generateCSharpExpression(node.object);
     const propertyName = t.isIdentifier(node.property) ? node.property.name : null;
+
+    // Handle ref.current → just ref (refs in C# are the value itself, not a container)
+    if (propertyName === 'current' && !node.computed && t.isIdentifier(node.object)) {
+      // Check if the object is a ref variable (ends with "Ref")
+      if (node.object.name.endsWith('Ref')) {
+        return object;  // Return just the ref variable name without .current
+      }
+    }
 
     // Handle JavaScript to C# API conversions
     if (propertyName === 'length' && !node.computed) {
@@ -544,8 +595,9 @@ function generateCSharpExpression(node, inInterpolation = false) {
         return `(${left}) && (${right})`;
       } else {
         // JavaScript: a && <jsx> or a && someValue
-        // C#: a != null ? value : null (for objects)
-        return `(${left}) != null ? (${right}) : null`;
+        // C#: a != null ? value : VNull (for objects)
+        const nodePath = node.__minimactPath || '';
+        return `(${left}) != null ? (${right}) : new VNull("${nodePath}")`;
       }
     }
 
@@ -599,6 +651,19 @@ function generateCSharpExpression(node, inInterpolation = false) {
       return `Uri.EscapeDataString(${args})`;
     }
 
+    // Handle setState(key, value) → SetState(key, value)
+    // This is the compile-time state proxy function for lifted state
+    if (t.isIdentifier(node.callee, { name: 'setState' })) {
+      if (node.arguments.length >= 2) {
+        const key = generateCSharpExpression(node.arguments[0]);
+        const value = generateCSharpExpression(node.arguments[1]);
+        return `SetState(${key}, ${value})`;
+      } else {
+        console.warn('[Babel Plugin] setState requires 2 arguments (key, value)');
+        return `SetState("", null)`;
+      }
+    }
+
     // Handle fetch() → HttpClient call
     // Note: This generates a basic wrapper. Real implementation would use IHttpClientFactory
     if (t.isIdentifier(node.callee, { name: 'fetch' })) {
@@ -634,6 +699,15 @@ function generateCSharpExpression(node, inInterpolation = false) {
       return `Console.WriteLine(${args})`;
     }
 
+    // Handle String(value) → value.ToString()
+    if (t.isIdentifier(node.callee, { name: 'String' })) {
+      if (node.arguments.length > 0) {
+        const arg = generateCSharpExpression(node.arguments[0]);
+        return `(${arg}).ToString()`;
+      }
+      return '""';
+    }
+
     // Handle Object.keys() → dictionary.Keys or reflection for objects
     if (t.isMemberExpression(node.callee) &&
         t.isIdentifier(node.callee.object, { name: 'Object' }) &&
@@ -643,6 +717,13 @@ function generateCSharpExpression(node, inInterpolation = false) {
         // For dynamic objects, cast to IDictionary and get Keys
         return `((IDictionary<string, object>)${obj}).Keys`;
       }
+    }
+
+    // Handle Date.now() → DateTimeOffset.Now.ToUnixTimeMilliseconds()
+    if (t.isMemberExpression(node.callee) &&
+        t.isIdentifier(node.callee.object, { name: 'Date' }) &&
+        t.isIdentifier(node.callee.property, { name: 'now' })) {
+      return 'DateTimeOffset.Now.ToUnixTimeMilliseconds()';
     }
 
     // Handle console.log → Console.WriteLine
@@ -701,6 +782,34 @@ function generateCSharpExpression(node, inInterpolation = false) {
       const object = generateCSharpExpression(node.callee.object);
       const args = node.arguments.map(arg => generateCSharpExpression(arg)).join(', ');
       return `${object}.Substring(${args})`;
+    }
+
+    // Handle .padStart(length, char) → .PadLeft(length, char)
+    if (t.isMemberExpression(node.callee) && t.isIdentifier(node.callee.property, { name: 'padStart' })) {
+      const object = generateCSharpExpression(node.callee.object);
+      const length = node.arguments[0] ? generateCSharpExpression(node.arguments[0]) : '0';
+      let padChar = node.arguments[1] ? generateCSharpExpression(node.arguments[1]) : '" "';
+
+      // Convert string literal "0" to char literal '0'
+      if (t.isStringLiteral(node.arguments[1]) && node.arguments[1].value.length === 1) {
+        padChar = `'${node.arguments[1].value}'`;
+      }
+
+      return `${object}.PadLeft(${length}, ${padChar})`;
+    }
+
+    // Handle .padEnd(length, char) → .PadRight(length, char)
+    if (t.isMemberExpression(node.callee) && t.isIdentifier(node.callee.property, { name: 'padEnd' })) {
+      const object = generateCSharpExpression(node.callee.object);
+      const length = node.arguments[0] ? generateCSharpExpression(node.arguments[0]) : '0';
+      let padChar = node.arguments[1] ? generateCSharpExpression(node.arguments[1]) : '" "';
+
+      // Convert string literal "0" to char literal '0'
+      if (t.isStringLiteral(node.arguments[1]) && node.arguments[1].value.length === 1) {
+        padChar = `'${node.arguments[1].value}'`;
+      }
+
+      return `${object}.PadRight(${length}, ${padChar})`;
     }
 
     // Handle useState/useClientState setters → SetState calls
@@ -971,7 +1080,9 @@ function generateCSharpExpression(node, inInterpolation = false) {
     return `${paramsString} => ${body}`;
   }
 
-  return 'null';
+  // Fallback for unknown node types
+  const nodePath = node?.__minimactPath || '';
+  return `new VNull("${nodePath}")`;
 }
 
 /**

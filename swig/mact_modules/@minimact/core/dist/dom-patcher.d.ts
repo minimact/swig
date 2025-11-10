@@ -1,7 +1,7 @@
 import { Patch } from './types';
 /**
  * Applies DOM patches from the server to the actual DOM
- * Handles surgical updates for minimal DOM manipulation
+ * Server sends DOM index-based patches - client just does simple array indexing!
  */
 export declare class DOMPatcher {
     private debugLogging;
@@ -18,6 +18,7 @@ export declare class DOMPatcher {
     private applyPatch;
     /**
      * Create and insert a new node
+     * The path is in node.path (converted DOM index path from server)
      */
     private patchCreate;
     /**
@@ -41,7 +42,8 @@ export declare class DOMPatcher {
      */
     private patchReorderChildren;
     /**
-     * Get a DOM element by its path (array of indices)
+     * Get a DOM element by its DOM index path
+     * Simple array indexing through childNodes - server handles all null path complexity!
      */
     private getElementByPath;
     /**

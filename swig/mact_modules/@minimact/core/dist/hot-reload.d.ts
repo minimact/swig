@@ -14,8 +14,10 @@
  */
 import { type TemplateMap, type TemplatePatch } from './template-state';
 import type { DOMPatcher } from './dom-patcher';
+import type { MinimactComponentRegistry } from './component-registry';
 interface Minimact {
     domPatcher: DOMPatcher;
+    componentRegistry: MinimactComponentRegistry;
     getComponent(componentId: string): any;
 }
 export interface HotReloadConfig {
@@ -60,6 +62,7 @@ export declare class HotReloadManager {
     private pendingVerifications;
     private reconnectAttempts;
     private maxReconnectAttempts;
+    private nullPaths;
     constructor(minimact: Minimact, config?: Partial<HotReloadConfig>);
     /**
      * Get default WebSocket URL based on current location
@@ -76,7 +79,7 @@ export declare class HotReloadManager {
     /**
      * Handle incoming WebSocket message
      */
-    private handleMessage;
+    handleMessage(message: HotReloadMessage): Promise<void>;
     /**
      * Handle file change - PREDICTIVE MAPPING APPROACH
      * Try prediction cache first (0-5ms), fall back to server (150ms)
@@ -101,8 +104,25 @@ export declare class HotReloadManager {
      */
     private handleTemplatePatch;
     /**
-     * Find DOM element by path array
-     * Example: [0, 1, 0] → first child, second child, first child
+     * Check if a path is currently null (not rendered)
+     */
+    private isPathNull;
+    /**
+     * Mark a path as null (not rendered)
+     */
+    private setPathNull;
+    /**
+     * Mark a path as non-null (rendered)
+     */
+    private setPathNonNull;
+    /**
+     * Update null paths from server patches
+     * The server tells us which paths are null when sending patches
+     */
+    private updateNullPaths;
+    /**
+     * Find DOM element by path (using DOM indices from server)
+     * Path can be either number[] or string representation
      */
     private findElementByPath;
     /**

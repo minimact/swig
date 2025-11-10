@@ -20,8 +20,11 @@ import type { DOMPatcher } from './dom-patcher';
 import type { HydrationManager } from './hydration';
 
 // Forward declaration to avoid circular dependency
+import type { MinimactComponentRegistry, ComponentMetadata } from './component-registry';
+
 interface Minimact {
   domPatcher: DOMPatcher;
+  componentRegistry: MinimactComponentRegistry;
   getComponent(componentId: string): any;
 }
 
@@ -71,6 +74,8 @@ export class HotReloadManager {
   private pendingVerifications = new Map<string, any>();
   private reconnectAttempts = 0;
   private maxReconnectAttempts = 5;
+  // Map of null paths: componentType -> Set of paths that are currently null (not rendered)
+  private nullPaths = new Map<string, Set<string>>();
 
   constructor(minimact: Minimact, config: Partial<HotReloadConfig> = {}) {
     this.minimact = minimact;
@@ -163,7 +168,7 @@ export class HotReloadManager {
   /**
    * Handle incoming WebSocket message
    */
-  private async handleMessage(message: HotReloadMessage) {
+  public async handleMessage(message: HotReloadMessage) {
     const startTime = performance.now();
 
     switch (message.type) {
@@ -333,14 +338,106 @@ export class HotReloadManager {
     if (!message.templateMap || !message.componentId) return;
 
     const startTime = performance.now();
+    // Note: message.componentId is actually the component TYPE name (e.g., "ProductDetailsPage")
+    const componentType = message.componentId;
+    const newTemplates = message.templateMap.templates;
 
-    // Load template map into template state manager
-    templateState.loadTemplateMap(message.componentId, message.templateMap);
+    console.log(`[HotReload] 🔍 Processing template map for ${componentType}:`, {
+      newTemplateCount: Object.keys(newTemplates).length,
+      newTemplateKeys: Object.keys(newTemplates).slice(0, 5)
+    });
+
+    // Debug: Check structure of first template
+    const firstKey = Object.keys(newTemplates)[0];
+    if (firstKey) {
+      console.log(`[HotReload] 🔍 First template structure:`, firstKey, newTemplates[firstKey]);
+    }
+
+    // Get existing templates to detect changes
+    const existingTemplates = new Map<string, Template>();
+    console.log(`[HotReload] 🔍 Checking for existing templates...`);
+    for (const [nodePath, template] of Object.entries(newTemplates)) {
+      const existing = templateState.getTemplate(componentType, nodePath);
+      // Note: Server sends 'templateString', client stores as 'template'
+      const newTemplateStr = (template as any).templateString || (template as any).template;
+      if (existing) {
+        const changed = existing.template !== newTemplateStr;
+        console.log(`[HotReload] ${changed ? '🔥' : '✅'} Template "${nodePath}": old="${existing.template}" new="${newTemplateStr}" changed=${changed}`);
+        existingTemplates.set(nodePath, existing);
+      } else {
+        console.log(`[HotReload] ❌ No existing template for ${nodePath}, new="${newTemplateStr}"`);
+      }
+    }
+
+    console.log(`[HotReload] 📋 Found ${existingTemplates.size} existing templates out of ${Object.keys(newTemplates).length}`);
+
+    // Load new template map
+    templateState.loadTemplateMap(componentType, message.templateMap);
+
+    // Get all instances of this component type from registry
+    const instances = this.minimact.componentRegistry.getByType(componentType);
+    console.log(`[HotReload] 🔍 Found ${instances.length} instance(s) of type "${componentType}"`);
+
+    if (instances.length === 0) {
+      console.warn(`[HotReload] ⚠️ No instances found for component type "${componentType}"`);
+      return;
+    }
+
+    // Apply templates to each instance
+    for (const instance of instances) {
+      console.log(`[HotReload] 📦 Processing instance ${instance.instanceId.substring(0, 8)}...`);
+
+      const patches: any[] = [];
+      let changedCount = 0;
+
+      for (const [nodePath, newTemplate] of Object.entries(newTemplates)) {
+        const existingTemplate = existingTemplates.get(nodePath);
+
+        // Check if template string changed
+        if (existingTemplate && existingTemplate.template !== newTemplate.template) {
+          changedCount++;
+          console.log(`[HotReload] 🔥 Template changed #${changedCount}: "${existingTemplate.template}" → "${newTemplate.template}"`);
+
+          // Get current state values for this instance's bindings
+          const params = newTemplate.bindings.map(binding =>
+            templateState.getStateValue(instance.instanceId, binding)
+          );
+
+          // Render template with current state
+          const text = (templateState as any).renderWithParams(newTemplate.template, params);
+
+          // Create patch for DOMPatcher
+          if (newTemplate.type === 'attribute' && newTemplate.attribute) {
+            patches.push({
+              type: 'UpdateProp',
+              path: newTemplate.path,
+              prop: newTemplate.attribute,
+              value: text
+            });
+          } else {
+            patches.push({
+              type: 'UpdateText',
+              path: newTemplate.path,
+              text: text
+            });
+          }
+        }
+      }
+
+      console.log(`[HotReload] 📊 Instance summary: ${changedCount} changed, ${patches.length} patches`);
+
+      // Apply all patches at once using DOMPatcher
+      if (patches.length > 0) {
+        this.minimact.domPatcher.applyPatches(instance.element, patches);
+        this.flashComponent(instance.element);
+        console.log(`[HotReload] ✅ Applied ${patches.length} patches to instance ${instance.instanceId.substring(0, 8)}`);
+      }
+    }
 
     const latency = performance.now() - startTime;
-    const templateCount = Object.keys(message.templateMap.templates).length;
+    const templateCount = Object.keys(newTemplates).length;
 
-    this.log('info', `📦 Loaded ${templateCount} templates for ${message.componentId} in ${latency.toFixed(1)}ms`);
+    this.log('info', `📦 Loaded ${templateCount} templates for ${componentType} in ${latency.toFixed(1)}ms`);
 
     const stats = templateState.getStats();
     this.log('debug', `Template stats: ${stats.templateCount} total, ~${stats.memoryKB}KB`);
@@ -355,16 +452,68 @@ export class HotReloadManager {
 
     const startTime = performance.now();
     const patch = message.templatePatch;
+    // Note: message.componentId is the component TYPE name
+    const componentType = message.componentId;
+
+    console.log(`[HotReload] 🔧 Applying template patch to ${componentType}:`, patch);
 
     try {
-      // Apply template patch
+      // Handle UpdateAttributeStatic separately (no template rendering needed)
+      if (patch.type === 'UpdateAttributeStatic') {
+        const attrName = (patch as any).attrName;
+        const value = (patch as any).value;
+
+        if (!attrName || value === undefined) {
+          console.warn(`[HotReload] ⚠️ UpdateAttributeStatic missing attrName or value:`, patch);
+          return;
+        }
+
+        // Get all instances of this component type
+        const instances = this.minimact.componentRegistry.getByType(componentType);
+        console.log(`[HotReload] 🔍 Found ${instances.length} instance(s) to update`);
+
+        if (instances.length === 0) {
+          console.warn(`[HotReload] ⚠️ No instances found for type "${componentType}"`);
+          return;
+        }
+
+        // Apply to each instance
+        for (const instance of instances) {
+          const element = this.findElementByPath(instance.element, patch.path, componentType);
+          if (element && element.nodeType === Node.ELEMENT_NODE) {
+            (element as HTMLElement).setAttribute(attrName, value);
+
+            const latency = performance.now() - startTime;
+            console.log(`[HotReload] 🚀 INSTANT! Updated static attribute ${attrName}="${value}" in ${latency.toFixed(1)}ms`);
+            this.log('info', `🚀 INSTANT! Static attribute updated in ${latency.toFixed(1)}ms`);
+            this.metrics.cacheHits++;
+            this.showToast(`⚡ ${latency.toFixed(0)}ms`, 'success', 800);
+            this.flashComponent(instance.element);
+          } else {
+            console.warn(`[HotReload] ⚠️ Element not found at path:`, patch.path);
+          }
+        }
+        return;
+      }
+
+      // Apply template patch to template state (for dynamic templates)
       const result = templateState.applyTemplatePatch(patch);
 
       if (result) {
-        // Update DOM
-        const component = this.minimact.getComponent(message.componentId);
-        if (component) {
-          const element = this.findElementByPath(component.element, result.path);
+        console.log(`[HotReload] 📝 Template patch result:`, result);
+
+        // Get all instances of this component type
+        const instances = this.minimact.componentRegistry.getByType(componentType);
+        console.log(`[HotReload] 🔍 Found ${instances.length} instance(s) to update`);
+
+        if (instances.length === 0) {
+          console.warn(`[HotReload] ⚠️ No instances found for type "${componentType}"`);
+          return;
+        }
+
+        // Apply to each instance
+        for (const instance of instances) {
+          const element = this.findElementByPath(instance.element, result.path, componentType);
           if (element) {
             if (patch.type === 'UpdateTextTemplate') {
               // Update text node
@@ -374,21 +523,26 @@ export class HotReloadManager {
                 element.textContent = result.text;
               }
             } else if (patch.type === 'UpdatePropTemplate' && patch.attribute) {
-              // Update attribute
+              // Update attribute (dynamic)
               (element as HTMLElement).setAttribute(patch.attribute, result.text);
             }
 
             const latency = performance.now() - startTime;
 
             // 🚀 INSTANT HOT RELOAD!
+            console.log(`[HotReload] 🚀 INSTANT! Updated instance ${instance.instanceId.substring(0, 8)} in ${latency.toFixed(1)}ms: "${result.text}"`);
             this.log('info', `🚀 INSTANT! Template updated in ${latency.toFixed(1)}ms: "${result.text}"`);
             this.metrics.cacheHits++;
             this.showToast(`⚡ ${latency.toFixed(0)}ms`, 'success', 800);
 
             // Flash component
-            this.flashComponent(component.element);
+            this.flashComponent(instance.element);
+          } else {
+            console.warn(`[HotReload] ⚠️ Element not found at path:`, result.path);
           }
         }
+      } else {
+        console.warn(`[HotReload] ⚠️ Template patch returned no result`);
       }
     } catch (error) {
       this.log('error', 'Template patch failed:', error);
@@ -400,15 +554,70 @@ export class HotReloadManager {
   }
 
   /**
-   * Find DOM element by path array
-   * Example: [0, 1, 0] → first child, second child, first child
+   * Check if a path is currently null (not rendered)
    */
-  private findElementByPath(root: HTMLElement, path: number[]): Node | null {
-    let current: Node | null = root;
+  private isPathNull(componentType: string, path: string): boolean {
+    return this.nullPaths.get(componentType)?.has(path) ?? false;
+  }
 
-    for (const index of path) {
-      if (!current || !current.childNodes) return null;
-      current = current.childNodes[index] || null;
+  /**
+   * Mark a path as null (not rendered)
+   */
+  private setPathNull(componentType: string, path: string): void {
+    if (!this.nullPaths.has(componentType)) {
+      this.nullPaths.set(componentType, new Set());
+    }
+    this.nullPaths.get(componentType)!.add(path);
+  }
+
+  /**
+   * Mark a path as non-null (rendered)
+   */
+  private setPathNonNull(componentType: string, path: string): void {
+    this.nullPaths.get(componentType)?.delete(path);
+  }
+
+  /**
+   * Update null paths from server patches
+   * The server tells us which paths are null when sending patches
+   */
+  private updateNullPaths(componentType: string, nullPathsFromServer: string[]): void {
+    this.nullPaths.set(componentType, new Set(nullPathsFromServer));
+  }
+
+  /**
+   * Find DOM element by path (using DOM indices from server)
+   * Path can be either number[] or string representation
+   */
+  private findElementByPath(root: HTMLElement, path: string | number[], componentType: string): Node | null {
+    if (path === '' || path === '.' || (Array.isArray(path) && path.length === 0)) {
+      return root;
+    }
+
+    // Parse path - server now sends DOM indices directly
+    let indices: number[];
+    if (typeof path === 'string') {
+      // Check if it's an attribute path
+      if (path.includes('@')) {
+        const segments = path.split('.');
+        const nonAttrSegments = segments.filter(s => !s.startsWith('@'));
+        indices = nonAttrSegments.map(s => parseInt(s, 10));
+      } else {
+        // Simple dot-separated indices
+        indices = path.split('.').map(s => parseInt(s, 10));
+      }
+    } else {
+      indices = path;
+    }
+
+    // Navigate using simple array indexing
+    let current: Node = root;
+    for (const index of indices) {
+      if (!current.childNodes || index >= current.childNodes.length) {
+        console.warn(`[HotReload] Index ${index} out of bounds (${current.childNodes?.length || 0} children)`);
+        return null;
+      }
+      current = current.childNodes[index];
     }
 
     return current;

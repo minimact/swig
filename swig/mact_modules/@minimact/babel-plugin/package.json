@@ -34,7 +34,9 @@
     "@babel/core": "^7.0.0"
   },
   "dependencies": {
-    "@babel/types": "^7.0.0"
+    "@babel/generator": "^7.28.5",
+    "@babel/types": "^7.0.0",
+    "recast": "^0.23.11"
   },
   "devDependencies": {
     "@babel/core": "^7.24.0",

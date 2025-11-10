@@ -3,6 +3,7 @@
  */
 export interface VNode {
     type: 'Element' | 'Text' | 'Fragment' | 'RawHtml';
+    path?: string;
 }
 export interface VElement extends VNode {
     type: 'Element';
@@ -82,40 +83,50 @@ export type ItemTemplate = {
 };
 export type Patch = {
     type: 'Create';
-    path: number[];
+    path: string | number[];
     node: VNode;
 } | {
     type: 'Remove';
-    path: number[];
+    path: string | number[];
 } | {
     type: 'Replace';
-    path: number[];
+    path: string | number[];
     node: VNode;
 } | {
     type: 'UpdateText';
-    path: number[];
+    path: string | number[];
     content: string;
 } | {
     type: 'UpdateProps';
-    path: number[];
+    path: string | number[];
     props: Record<string, string>;
 } | {
     type: 'ReorderChildren';
-    path: number[];
+    path: string | number[];
     order: string[];
 } | {
     type: 'UpdateTextTemplate';
-    path: number[];
+    path: string | number[];
     templatePatch: TemplatePatch;
 } | {
     type: 'UpdatePropsTemplate';
-    path: number[];
+    path: string | number[];
     propName: string;
     templatePatch: TemplatePatch;
 } | {
     type: 'UpdateListTemplate';
-    path: number[];
+    path: string | number[];
     loopTemplate: LoopTemplate;
+} | {
+    type: 'UpdateAttributeStatic';
+    path: string | number[];
+    attrName: string;
+    value: string;
+} | {
+    type: 'UpdateAttributeDynamic';
+    path: string | number[];
+    attrName: string;
+    templatePatch: TemplatePatch;
 };
 export interface ComponentState {
     [key: string]: any;
@@ -124,9 +135,12 @@ export interface MinimactOptions {
     hubUrl?: string;
     enableDebugLogging?: boolean;
     reconnectInterval?: number;
+    enableHotReload?: boolean;
+    hotReloadWsUrl?: string;
 }
 export interface ComponentMetadata {
     componentId: string;
+    type?: string;
     connectionId?: string;
     element: HTMLElement;
     clientState: ComponentState;

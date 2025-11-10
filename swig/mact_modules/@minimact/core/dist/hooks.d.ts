@@ -40,6 +40,23 @@ export declare function clearComponentContext(): void;
  */
 export declare function useState<T>(initialValue: T): [T, (newValue: T | ((prev: T) => T)) => void];
 /**
+ * useProtectedState hook - like useState but parent cannot access via state proxy
+ *
+ * Protected state is still lifted to parent (visible for debugging/prediction)
+ * but parent components cannot read/write it via state["Child.key"] or setState("Child.key", value)
+ *
+ * Use this for internal component state that should be encapsulated (caches, buffers, etc.)
+ *
+ * @example
+ * ```tsx
+ * function UserProfile() {
+ *   const [email, setEmail] = useState("");  // Public - parent can access
+ *   const [cache, setCache] = useProtectedState({});  // Protected - parent CANNOT access
+ * }
+ * ```
+ */
+export declare function useProtectedState<T>(initialValue: T): [T, (newValue: T | ((prev: T) => T)) => void];
+/**
  * useEffect hook - runs side effects after render
  */
 export declare function useEffect(callback: () => void | (() => void), deps?: any[]): void;

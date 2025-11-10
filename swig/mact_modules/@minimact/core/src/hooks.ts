@@ -57,13 +57,18 @@ export function clearComponentContext(): void {
 }
 
 /**
- * Find DOM element by path array
- * Example: [0, 1, 0] → first child, second child, first child
+ * Find DOM element by hex path string
+ * Example: "10000000.20000000.30000000" → convert to indices and navigate
  */
-function findElementByPath(root: HTMLElement, path: number[]): Node | null {
-  let current: Node | null = root;
+function findElementByPath(root: HTMLElement, path: string): Node | null {
+  if (path === '' || path === '.') {
+    return root;
+  }
 
-  for (const index of path) {
+  let current: Node | null = root;
+  const indices = path.split('.').map(hex => parseInt(hex, 16));
+
+  for (const index of indices) {
     if (!current || !current.childNodes) return null;
     current = current.childNodes[index] || null;
   }
@@ -147,8 +152,8 @@ export function useState<T>(initialValue: T): [T, (newValue: T | ((prev: T) => T
     // Re-render templates bound to this state
     const boundTemplates = templateState.getTemplatesBoundTo(context.componentId, stateKey);
     for (const template of boundTemplates) {
-      // Build node path from template path array
-      const nodePath = template.path.join('_');
+      // Build node path key from hex path string
+      const nodePath = template.path.replace(/\./g, '_');
 
       // Render template with new value
       const newText = templateState.render(context.componentId, nodePath);
@@ -186,6 +191,29 @@ export function useState<T>(initialValue: T): [T, (newValue: T | ((prev: T) => T
   }
 
   return [currentValue, setState];
+}
+
+/**
+ * useProtectedState hook - like useState but parent cannot access via state proxy
+ *
+ * Protected state is still lifted to parent (visible for debugging/prediction)
+ * but parent components cannot read/write it via state["Child.key"] or setState("Child.key", value)
+ *
+ * Use this for internal component state that should be encapsulated (caches, buffers, etc.)
+ *
+ * @example
+ * ```tsx
+ * function UserProfile() {
+ *   const [email, setEmail] = useState("");  // Public - parent can access
+ *   const [cache, setCache] = useProtectedState({});  // Protected - parent CANNOT access
+ * }
+ * ```
+ */
+export function useProtectedState<T>(initialValue: T): [T, (newValue: T | ((prev: T) => T)) => void] {
+  // useProtectedState is identical to useState on the client
+  // The protection is enforced on the server (C# GetState/SetState)
+  // The Babel plugin marks these keys as protected in VComponentWrapper
+  return useState(initialValue);
 }
 
 /**

@@ -2,7 +2,7 @@ import { Patch, VNode, VElement, VText } from './types';
 
 /**
  * Applies DOM patches from the server to the actual DOM
- * Handles surgical updates for minimal DOM manipulation
+ * Server sends DOM index-based patches - client just does simple array indexing!
  */
 export class DOMPatcher {
   private debugLogging: boolean;
@@ -61,30 +61,52 @@ export class DOMPatcher {
 
   /**
    * Create and insert a new node
+   * The path is in node.path (converted DOM index path from server)
    */
-  private patchCreate(rootElement: HTMLElement, path: number[], node: VNode): void {
+  private patchCreate(rootElement: HTMLElement, path: string | number[], node: VNode): void {
     const newElement = this.createElementFromVNode(node);
 
-    if (path.length === 0) {
-      // Replace root
-      rootElement.innerHTML = '';
-      rootElement.appendChild(newElement);
-    } else {
-      // Insert at path
-      const parentPath = path.slice(0, -1);
-      const index = path[path.length - 1];
-      const parent = this.getElementByPath(rootElement, parentPath) as HTMLElement;
-
-      if (parent) {
-        if (index >= parent.childNodes.length) {
-          parent.appendChild(newElement);
-        } else {
-          parent.insertBefore(newElement, parent.childNodes[index]);
-        }
-      }
+    // Get path from node.path (it's a string like "0.1.1.2")
+    const nodePath = node.path;
+    if (!nodePath) {
+      console.error('[DOMPatcher] Node has no path for Create');
+      return;
     }
 
-    this.log('Created node', { path, node });
+    // Convert string path to number array
+    const indices = nodePath.split('.').map(s => parseInt(s, 10));
+
+    if (indices.length === 0) {
+      console.error('[DOMPatcher] Invalid empty path for Create');
+      return;
+    }
+
+    // Handle root insertion
+    if (indices.length === 1 && indices[0] === 0) {
+      rootElement.innerHTML = '';
+      rootElement.appendChild(newElement);
+      this.log('Created root node', { node });
+      return;
+    }
+
+    // Navigate to parent using all but last index
+    const parentIndices = indices.slice(0, -1);
+    const insertionIndex = indices[indices.length - 1];
+    const parent = this.getElementByPath(rootElement, parentIndices) as HTMLElement;
+
+    if (!parent) {
+      console.error('[DOMPatcher] Parent not found for Create at path:', nodePath);
+      return;
+    }
+
+    // Insert at the specified index
+    if (insertionIndex >= parent.childNodes.length) {
+      parent.appendChild(newElement);
+    } else {
+      parent.insertBefore(newElement, parent.childNodes[insertionIndex]);
+    }
+
+    this.log('Created node', { path: nodePath, node });
   }
 
   /**
@@ -184,13 +206,23 @@ export class DOMPatcher {
   }
 
   /**
-   * Get a DOM element by its path (array of indices)
+   * Get a DOM element by its DOM index path
+   * Simple array indexing through childNodes - server handles all null path complexity!
    */
-  private getElementByPath(rootElement: HTMLElement, path: number[]): Node | null {
-    let current: Node = rootElement;
+  private getElementByPath(rootElement: HTMLElement, path: string | number[]): Node | null {
+    // Handle empty path
+    if (!path || (Array.isArray(path) && path.length === 0)) {
+      return rootElement;
+    }
 
-    for (const index of path) {
+    // Path should be number array from server (DomPatch)
+    const indices = Array.isArray(path) ? path : [];
+
+    // Simple navigation through childNodes using indices
+    let current: Node = rootElement;
+    for (const index of indices) {
       if (index >= current.childNodes.length) {
+        console.error(`[DOMPatcher] Index ${index} out of bounds (${current.childNodes.length} children)`);
         return null;
       }
       current = current.childNodes[index];

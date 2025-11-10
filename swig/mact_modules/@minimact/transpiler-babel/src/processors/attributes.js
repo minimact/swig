@@ -1,0 +1,528 @@
+/**
+ * Attribute Processor for Minimact Transpiler
+ *
+ * PHASE 1 - FIRST PASS: Attribute structure capture
+ *
+ * Handles all JSX attribute types:
+ * - Static strings: className="btn"
+ * - Boolean: disabled, checked={true}
+ * - Dynamic expressions: className={style}
+ * - Template literals: className={`count-${count}`}
+ * - Style objects: style={{ color: 'red' }}
+ * - Spread: {...props}
+ *
+ * Reuses patterns from:
+ * babel-plugin-minimact/src/extractors/templates.cjs (lines 850-900)
+ * babel-plugin-minimact/src/generators/jsx.cjs (lines 102-140)
+ */
+
+const { extractStyleObject } = require('../extractors/styles');
+const { extractEventHandler } = require('../extractors/eventHandlers');
+const { extractComplexExpression } = require('../extractors/complexExpressions');
+const { buildMemberPath: buildMemberPathUtil } = require('../utils/astHelpers');
+
+/**
+ * Process all attributes on a JSX element
+ *
+ * Main entry point for attribute processing. Iterates through attributes
+ * and delegates to specific processors based on attribute type.
+ *
+ * Pattern from old plugin: templates.cjs lines 850-900
+ *
+ * @param {Array} attributes - Array of JSX attribute nodes
+ * @param {string} parentPath - Parent element hex path
+ * @param {Array} parentSegments - Parent path segments
+ * @param {HexPathGenerator} pathGen - Hex path generator
+ * @param {Object} t - Babel types
+ * @param {Object} component - Component context (for event handlers)
+ * @returns {Array} - Array of processed attribute nodes
+ */
+function processAttributes(attributes, parentPath, parentSegments, pathGen, t, component) {
+  const result = [];
+
+  for (const attr of attributes) {
+    if (t.isJSXAttribute(attr)) {
+      // Standard attribute: name="value" or name={expression}
+      const processed = processJSXAttribute(attr, parentPath, parentSegments, t, component);
+      if (processed) {
+        result.push(processed);
+      }
+    } else if (t.isJSXSpreadAttribute(attr)) {
+      // Spread attribute: {...props}
+      const processed = processSpreadAttribute(attr, parentPath, parentSegments, t);
+      if (processed) {
+        result.push(processed);
+      }
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Process a standard JSX attribute
+ *
+ * Determines attribute type and delegates to appropriate processor.
+ *
+ * @param {Object} attr - JSX attribute node
+ * @param {string} parentPath - Parent element hex path
+ * @param {Array} parentSegments - Parent path segments
+ * @param {Object} t - Babel types
+ * @param {Object} component - Component context
+ * @returns {Object|null} - Processed attribute node
+ */
+function processJSXAttribute(attr, parentPath, parentSegments, t, component) {
+  const attrName = attr.name.name;
+  const attrValue = attr.value;
+
+  // Generate attribute path with @ prefix
+  const attrPath = `${parentPath}.@${attrName}`;
+  const attrSegments = [...parentSegments, `@${attrName}`];
+
+  // 1. Boolean attribute: <button disabled> or <input checked />
+  if (!attrValue || attrValue === null) {
+    return processBooleanAttribute(attr, attrPath, attrSegments);
+  }
+
+  // 2. Static string: className="container"
+  if (t.isStringLiteral(attrValue)) {
+    return processStaticAttribute(attr, attrPath, attrSegments, t);
+  }
+
+  // 3. Dynamic expression: className={expression}
+  if (t.isJSXExpressionContainer(attrValue)) {
+    return processDynamicAttribute(attr, attrPath, attrSegments, t, component);
+  }
+
+  // Unknown attribute type
+  console.warn('[Attributes] Unknown attribute type:', attr.type);
+  return null;
+}
+
+/**
+ * Process static string attribute
+ *
+ * Example: className="btn-primary"
+ * Pattern from old plugin: templates.cjs lines 879-890
+ *
+ * @param {Object} attr - JSX attribute node
+ * @param {string} attrPath - Attribute hex path
+ * @param {Array} attrSegments - Attribute path segments
+ * @param {Object} t - Babel types
+ * @returns {Object} - StaticAttribute node
+ */
+function processStaticAttribute(attr, attrPath, attrSegments, t) {
+  const attrName = attr.name.name;
+  const value = attr.value.value;
+
+  console.log(`    [Attr] ${attrName}="${value}" (static) → ${attrPath}`);
+
+  return {
+    type: 'StaticAttribute',
+    name: attrName,
+    value: value,
+    path: attrPath,
+    pathSegments: attrSegments
+  };
+}
+
+/**
+ * Process dynamic expression attribute
+ *
+ * Handles:
+ * - Simple identifier: className={myClass}
+ * - Member expression: className={user.role}
+ * - Template literal: className={`count-${count}`}
+ * - Style object: style={{ color: 'red' }}
+ * - Other expressions: className={condition ? 'a' : 'b'}
+ *
+ * Pattern from old plugin: templates.cjs lines 856-877
+ *
+ * @param {Object} attr - JSX attribute node
+ * @param {string} attrPath - Attribute hex path
+ * @param {Array} attrSegments - Attribute path segments
+ * @param {Object} t - Babel types
+ * @returns {Object} - DynamicAttribute node
+ */
+function processDynamicAttribute(attr, attrPath, attrSegments, t, component) {
+  const attrName = attr.name.name;
+  const expr = attr.value.expression;
+
+  // Check if event handler FIRST before other processing
+  if (isEventHandler(attrName)) {
+    return processEventHandler(attr, attrPath, attrSegments, t, component);
+  }
+
+  const expressionType = getExpressionType(expr, t);
+
+  console.log(`    [Attr] ${attrName}={...} (${expressionType}) → ${attrPath}`);
+
+  const attrNode = {
+    type: 'DynamicAttribute',
+    name: attrName,
+    expressionType,
+    path: attrPath,
+    pathSegments: attrSegments
+  };
+
+  // Extract bindings based on expression type
+  if (t.isIdentifier(expr)) {
+    // Simple binding: className={myClass}
+    attrNode.bindings = [{
+      type: 'Identifier',
+      path: expr.name
+    }];
+    attrNode.template = '{0}';
+  } else if (t.isMemberExpression(expr)) {
+    // Member expression: className={user.role}
+    attrNode.bindings = [{
+      type: 'MemberExpression',
+      path: buildMemberPath(expr, t)
+    }];
+    attrNode.template = '{0}';
+  } else if (t.isTemplateLiteral(expr)) {
+    // Template literal: className={`count-${count}`}
+    // Will be extracted in Phase 2
+    attrNode.bindings = extractTemplateLiteralBindings(expr, t);
+    attrNode.template = buildTemplateString(expr, t);
+  } else if (t.isObjectExpression(expr) && attrName === 'style') {
+    // Style object: style={{ fontSize: '32px', opacity: isVisible ? 1 : 0.5 }}
+    // Use comprehensive style extractor
+    const styleInfo = extractStyleObject(expr, t);
+
+    if (styleInfo) {
+      attrNode.subtype = 'style-object';
+      attrNode.styleObject = styleInfo;
+
+      // If style has bindings, extract them
+      if (styleInfo.hasBindings) {
+        attrNode.bindings = styleInfo.bindings.map(binding => ({
+          type: 'StyleBinding',
+          path: binding
+        }));
+        attrNode.template = styleInfo.css;
+        attrNode.slots = styleInfo.slots;
+
+        console.log(`    [Attr] style={...} with ${styleInfo.bindings.length} binding(s): "${styleInfo.css.substring(0, 50)}${styleInfo.css.length > 50 ? '...' : ''}"`);
+      } else {
+        // Static style - can be converted to string immediately
+        attrNode.value = styleInfo.css;
+
+        console.log(`    [Attr] style={...} (static): "${styleInfo.css.substring(0, 50)}${styleInfo.css.length > 50 ? '...' : ''}"`);
+      }
+    } else {
+      // Fallback to old structure extraction
+      console.warn(`    [Attr] style={...} extraction failed, using fallback`);
+      attrNode.styleObject = extractStyleObjectStructure(expr, t);
+    }
+  } else {
+    // Complex expression - extract as template with expression tree
+    try {
+      const complexInfo = extractComplexExpression(expr, t);
+      attrNode.template = complexInfo.template;
+      attrNode.bindings = complexInfo.bindings.map(b => ({
+        type: 'Identifier',
+        path: b
+      }));
+      attrNode.expressionTree = complexInfo.expressionTree;
+      attrNode.isComplexTemplate = true;
+
+      console.log(`    [Attr] ${attrName}={...} ComplexTemplate: "${complexInfo.template}"`);
+    } catch (e) {
+      // Fallback for truly unknown expressions
+      attrNode.raw = '<complex>';
+      console.log(`    [Attr] ${attrName}={...} Complex (unable to extract): ${e.message}`);
+    }
+  }
+
+  return attrNode;
+}
+
+/**
+ * Process boolean attribute
+ *
+ * Example: <button disabled> or <input checked />
+ * Pattern from old plugin: jsx.cjs (implicit boolean handling)
+ *
+ * @param {Object} attr - JSX attribute node
+ * @param {string} attrPath - Attribute hex path
+ * @param {Array} attrSegments - Attribute path segments
+ * @returns {Object} - BooleanAttribute node
+ */
+function processBooleanAttribute(attr, attrPath, attrSegments) {
+  const attrName = attr.name.name;
+
+  console.log(`    [Attr] ${attrName}=true (boolean) → ${attrPath}`);
+
+  return {
+    type: 'BooleanAttribute',
+    name: attrName,
+    value: true,
+    path: attrPath,
+    pathSegments: attrSegments
+  };
+}
+
+/**
+ * Process event handler attribute
+ *
+ * Handles onClick, onChange, onSubmit, and other event attributes.
+ * Extracts handler function and registers it with component.
+ *
+ * Examples:
+ * - onClick={() => handleClick()} → Extract inline handler
+ * - onClick={handleClick} → Method reference
+ * - onChange={(e) => setValue(e.target.value)} → Event parameter handling
+ *
+ * Pattern from babel-plugin-minimact/src/extractors/eventHandlers.cjs
+ *
+ * @param {Object} attr - JSX attribute node
+ * @param {string} attrPath - Attribute hex path
+ * @param {Array} attrSegments - Attribute path segments
+ * @param {Object} t - Babel types
+ * @param {Object} component - Component context
+ * @returns {Object} - EventHandlerAttribute node
+ */
+function processEventHandler(attr, attrPath, attrSegments, t, component) {
+  const attrName = attr.name.name;
+  const attrValue = attr.value;
+
+  // Initialize component.eventHandlers if needed
+  if (!component.eventHandlers) {
+    component.eventHandlers = [];
+  }
+
+  // Extract handler name/registration string
+  const handlerRegistration = extractEventHandler(attrName, attrValue, component, t);
+
+  console.log(`    [Attr] ${attrName}={...} (event handler) → ${handlerRegistration}`);
+
+  return {
+    type: 'EventHandlerAttribute',
+    name: attrName,
+    handler: handlerRegistration,
+    path: attrPath,
+    pathSegments: attrSegments
+  };
+}
+
+/**
+ * Process spread attribute
+ *
+ * Example: <div {...props}>
+ * Pattern from old plugin: jsx.cjs lines 86-94 (spread detection)
+ *
+ * @param {Object} attr - JSX spread attribute node
+ * @param {string} parentPath - Parent element hex path
+ * @param {Array} parentSegments - Parent path segments
+ * @param {Object} t - Babel types
+ * @returns {Object} - SpreadAttribute node
+ */
+function processSpreadAttribute(attr, parentPath, parentSegments, t) {
+  const attrPath = `${parentPath}.@spread`;
+  const attrSegments = [...parentSegments, `@spread`];
+
+  // Extract spread argument (usually an identifier)
+  const raw = t.isIdentifier(attr.argument) ? attr.argument.name : '<complex>';
+
+  console.log(`    [Attr] {...${raw}} (spread) → ${attrPath}`);
+
+  return {
+    type: 'SpreadAttribute',
+    expressionType: 'SpreadElement',
+    raw,
+    path: attrPath,
+    pathSegments: attrSegments
+  };
+}
+
+/**
+ * Get expression type as string
+ *
+ * @param {Object} expr - Babel expression node
+ * @param {Object} t - Babel types
+ * @returns {string} - Expression type name
+ */
+function getExpressionType(expr, t) {
+  if (t.isIdentifier(expr)) return 'Identifier';
+  if (t.isMemberExpression(expr)) return 'MemberExpression';
+  if (t.isTemplateLiteral(expr)) return 'TemplateLiteral';
+  if (t.isObjectExpression(expr)) return 'ObjectExpression';
+  if (t.isConditionalExpression(expr)) return 'ConditionalExpression';
+  if (t.isLogicalExpression(expr)) return 'LogicalExpression';
+  if (t.isBinaryExpression(expr)) return 'BinaryExpression';
+  if (t.isCallExpression(expr)) return 'CallExpression';
+  if (t.isArrayExpression(expr)) return 'ArrayExpression';
+  if (t.isNumericLiteral(expr)) return 'NumericLiteral';
+  if (t.isStringLiteral(expr)) return 'StringLiteral';
+  if (t.isBooleanLiteral(expr)) return 'BooleanLiteral';
+  if (t.isNullLiteral(expr)) return 'NullLiteral';
+  return 'Unknown';
+}
+
+/**
+ * Build member expression path
+ *
+ * Example: user.profile.name → "user.profile.name"
+ * Pattern from old plugin: templates.cjs lines 767-783
+ *
+ * @param {Object} expr - Member expression node
+ * @param {Object} t - Babel types
+ * @returns {string} - Dotted path string
+ */
+function buildMemberPath(expr, t) {
+  // Use utility function for consistency
+  return buildMemberPathUtil(expr, t);
+}
+
+/**
+ * Extract bindings from template literal (Phase 1 - basic structure only)
+ *
+ * Example: `Count: ${count}` → [{ type: 'Identifier', path: 'count' }]
+ * Pattern from old plugin: templates.cjs lines 223-270
+ *
+ * @param {Object} node - Template literal node
+ * @param {Object} t - Babel types
+ * @returns {Array} - Array of binding objects
+ */
+function extractTemplateLiteralBindings(node, t) {
+  const bindings = [];
+
+  for (const expr of node.expressions) {
+    if (t.isIdentifier(expr)) {
+      bindings.push({
+        type: 'Identifier',
+        path: expr.name
+      });
+    } else if (t.isMemberExpression(expr)) {
+      bindings.push({
+        type: 'MemberExpression',
+        path: buildMemberPath(expr, t)
+      });
+    } else {
+      bindings.push({
+        type: 'Complex',
+        path: '<complex>'
+      });
+    }
+  }
+
+  return bindings;
+}
+
+/**
+ * Build template string with slot placeholders
+ *
+ * Example: `Count: ${count}` → "Count: {0}"
+ *
+ * @param {Object} node - Template literal node
+ * @param {Object} t - Babel types
+ * @returns {string} - Template string with {0}, {1}... placeholders
+ */
+function buildTemplateString(node, t) {
+  let template = '';
+  let slotIndex = 0;
+
+  for (let i = 0; i < node.quasis.length; i++) {
+    template += node.quasis[i].value.raw;
+
+    if (i < node.expressions.length) {
+      template += `{${slotIndex}}`;
+      slotIndex++;
+    }
+  }
+
+  return template;
+}
+
+/**
+ * Extract style object structure (Phase 1 - basic capture only)
+ *
+ * Example: { fontSize: '32px', opacity: isVisible ? 1 : 0.5 }
+ * Full extraction happens in Phase 2
+ *
+ * @param {Object} expr - Object expression node
+ * @param {Object} t - Babel types
+ * @returns {Array} - Array of property objects
+ */
+function extractStyleObjectStructure(expr, t) {
+  const properties = [];
+
+  for (const prop of expr.properties) {
+    if (t.isObjectProperty(prop)) {
+      const key = t.isIdentifier(prop.key) ? prop.key.name : String(prop.key.value);
+      const value = prop.value;
+
+      if (t.isStringLiteral(value) || t.isNumericLiteral(value)) {
+        // Static value
+        properties.push({
+          key,
+          value: String(value.value),
+          isStatic: true
+        });
+      } else if (t.isIdentifier(value)) {
+        // Dynamic binding
+        properties.push({
+          key,
+          binding: value.name,
+          isStatic: false
+        });
+      } else if (t.isMemberExpression(value)) {
+        // Dynamic member expression
+        properties.push({
+          key,
+          binding: buildMemberPath(value, t),
+          isStatic: false
+        });
+      } else {
+        // Complex (conditional, etc.) - Phase 2
+        properties.push({
+          key,
+          value: '<complex>',
+          isStatic: false
+        });
+      }
+    }
+  }
+
+  return properties;
+}
+
+/**
+ * Check if attribute is an event handler
+ *
+ * Examples: onClick, onChange, onSubmit
+ *
+ * @param {string} attrName - Attribute name
+ * @returns {boolean} - True if event handler
+ */
+function isEventHandler(attrName) {
+  return attrName.startsWith('on') && attrName.length > 2 && attrName[2] === attrName[2].toUpperCase();
+}
+
+/**
+ * Convert className to class (HTML compatibility)
+ *
+ * Pattern from old plugin: jsx.cjs line 108
+ *
+ * @param {string} attrName - Attribute name
+ * @returns {string} - HTML attribute name
+ */
+function normalizeAttributeName(attrName) {
+  if (attrName === 'className') {
+    return 'class';
+  }
+  return attrName;
+}
+
+module.exports = {
+  processAttributes,
+  processStaticAttribute,
+  processDynamicAttribute,
+  processBooleanAttribute,
+  processSpreadAttribute,
+  isEventHandler,
+  normalizeAttributeName,
+  buildMemberPath,
+  getExpressionType
+};

@@ -19,6 +19,8 @@ const { extractLoopTemplates } = require('./extractors/loopTemplates.cjs');
 const { extractStructuralTemplates } = require('./extractors/structuralTemplates.cjs');
 const { extractExpressionTemplates } = require('./extractors/expressionTemplates.cjs');
 const { analyzePluginUsage, validatePluginUsage } = require('./analyzers/analyzePluginUsage.cjs');
+const { HexPathGenerator } = require('./utils/hexPath.cjs');
+const { assignPathsToJSX } = require('./utils/pathAssignment.cjs');
 
 /**
  * Process a component function
@@ -178,8 +180,9 @@ function processComponent(path, state) {
 
     ReturnStatement(returnPath) {
       if (returnPath.getFunctionParent() === path) {
-        // Deep clone the AST node to preserve it before we replace JSX with null
-        component.renderBody = t.cloneNode(returnPath.node.argument, true);
+        // Store a REFERENCE to the actual live AST node (not a clone!)
+        // We'll add keys to THIS node, and it will persist in the Program tree
+        component.renderBody = returnPath.node.argument;
       }
     }
   });
@@ -190,6 +193,27 @@ function processComponent(path, state) {
 
   // Extract templates from JSX for hot reload (BEFORE replacing JSX with null)
   if (component.renderBody) {
+    // 🔥 CRITICAL: Assign hex paths to all JSX nodes FIRST
+    // This ensures all extractors use the same paths (no recalculation!)
+    const pathGen = new HexPathGenerator();
+    const structuralChanges = []; // Track insertions for hot reload
+
+    // Check if this is a hot reload by looking for previous .tsx.keys file
+    const fs = require('fs');
+    const nodePath = require('path');
+    const inputFilePath = state.file.opts.filename;
+    const keysFilePath = inputFilePath ? inputFilePath + '.keys' : null;
+    const isHotReload = keysFilePath && fs.existsSync(keysFilePath);
+
+    assignPathsToJSX(component.renderBody, '', pathGen, t, null, null, structuralChanges, isHotReload);
+    console.log(`[Minimact Hex Paths] ✅ Assigned hex paths to ${componentName} JSX tree${isHotReload ? ' (hot reload mode)' : ''}`);
+
+    // Store structural changes on component for later processing
+    if (structuralChanges.length > 0) {
+      component.structuralChanges = structuralChanges;
+      console.log(`[Hot Reload] Found ${structuralChanges.length} structural changes in ${componentName}`);
+    }
+
     const textTemplates = extractTemplates(component.renderBody, component);
     const attrTemplates = extractAttributeTemplates(component.renderBody, component);
     const allTemplates = { ...textTemplates, ...attrTemplates };
@@ -290,14 +314,11 @@ function processComponent(path, state) {
     }
   }
 
-  // Now replace JSX to prevent @babel/preset-react from transforming it
-  path.traverse({
-    ReturnStatement(returnPath) {
-      if (returnPath.getFunctionParent() === path) {
-        returnPath.node.argument = t.nullLiteral();
-      }
-    }
-  });
+  // Store the component path so we can nullify JSX later (after .tsx.keys generation)
+  if (!state.file.componentPathsToNullify) {
+    state.file.componentPathsToNullify = [];
+  }
+  state.file.componentPathsToNullify.push(path);
 
   state.file.minimactComponents.push(component);
 }
